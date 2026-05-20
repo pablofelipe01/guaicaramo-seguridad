@@ -55,6 +55,7 @@ AIRTABLE_API_TOKEN = os.getenv("AIRTABLE_API_TOKEN", "").strip()
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
 AIRTABLE_PLACAS_TABLE = os.getenv("AIRTABLE_PLACAS_TABLE", "Placas").strip()
 AIRTABLE_REGISTROS_TABLE = os.getenv("AIRTABLE_REGISTROS_TABLE", "Registros").strip()
+AIRTABLE_PERSONAS_TABLE = os.getenv("AIRTABLE_PERSONAS_TABLE", "Personas").strip()
 
 # Conexión al nodo Meshtastic. Una de las tres debe estar definida.
 MESHTASTIC_SERIAL = os.getenv("MESHTASTIC_SERIAL", "").strip()  # ej: /dev/ttyUSB0
@@ -118,6 +119,25 @@ def airtable_find_placa(placa: str) -> dict[str, Any] | None:
     return records[0] if records else None
 
 
+def airtable_find_persona(cedula: str) -> dict[str, Any] | None:
+    """Busca una cédula exacta en la tabla Personas."""
+    cedula_clean = cedula.strip()
+    formula = f"{{cedula}} = '{cedula_clean}'"
+    params = {"filterByFormula": formula, "maxRecords": 1}
+    resp = requests.get(
+        _airtable_url(AIRTABLE_PERSONAS_TABLE),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"GET Personas HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    records = resp.json().get("records", [])
+    return records[0] if records else None
+
+
 def airtable_create_registro(fields: dict[str, Any]) -> str:
     resp = requests.post(
         _airtable_url(AIRTABLE_REGISTROS_TABLE),
@@ -147,16 +167,44 @@ def airtable_update_registro(record_id: str, fields: dict[str, Any]) -> None:
 
 
 def airtable_find_active_entry(placa: str) -> dict[str, Any] | None:
-    """
-    Busca el registro de ENTRADA más reciente sin salida para una placa.
-
-    Filtra por: tipo=ENTRADA AND UPPER(placa)=X AND exit_time es null.
-    """
+    """Busca el registro de ENTRADA vehícular más reciente sin salida."""
     placa_upper = placa.upper().strip()
     formula = (
         "AND("
         f"UPPER({{placa}}) = '{placa_upper}',"
         "{tipo} = 'ENTRADA',"
+        "{categoria} = 'VEHICULO',"
+        "{exit_time} = BLANK()"
+        ")"
+    )
+    params = {
+        "filterByFormula": formula,
+        "maxRecords": 1,
+        "sort[0][field]": "entry_time",
+        "sort[0][direction]": "desc",
+    }
+    resp = requests.get(
+        _airtable_url(AIRTABLE_REGISTROS_TABLE),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"GET Registros HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    records = resp.json().get("records", [])
+    return records[0] if records else None
+
+
+def airtable_find_active_person(cedula: str) -> dict[str, Any] | None:
+    """Busca el registro de ENTRADA peatonal más reciente sin salida."""
+    cedula_clean = cedula.strip()
+    formula = (
+        "AND("
+        f"{{cedula}} = '{cedula_clean}',"
+        "{tipo} = 'ENTRADA',"
+        "{categoria} = 'PEATON',"
         "{exit_time} = BLANK()"
         ")"
     )
@@ -262,6 +310,7 @@ def handle_entrada(interface, from_num: int, parts: list[str]) -> None:
         record_id = airtable_create_registro(
             {
                 "tipo": "ENTRADA",
+                "categoria": "VEHICULO",
                 "cedula": cedula,
                 "placa": placa,
                 "entry_time": _now_iso(),
@@ -292,6 +341,7 @@ def handle_salida(interface, from_num: int, parts: list[str]) -> None:
             airtable_create_registro(
                 {
                     "tipo": "SALIDA",
+                    "categoria": "VEHICULO",
                     "placa": placa,
                     "exit_time": _now_iso(),
                     "nodo_origen": _node_hex(from_num),
@@ -326,6 +376,7 @@ def handle_registro_manual(interface, from_num: int, parts: list[str]) -> None:
     try:
         fields = {
             "tipo": "ENTRADA" if status == "APROBADO" else "MANUAL",
+            "categoria": "VEHICULO",
             "cedula": cedula,
             "placa": placa,
             "approved_by": supervisor,
@@ -346,8 +397,160 @@ def handle_registro_manual(interface, from_num: int, parts: list[str]) -> None:
         log.error("Excepción en REGISTRO_MANUAL:\n%s", traceback.format_exc())
 
 
-# Mapa prefijo → handler.
+# ---------- Handlers de peatones ----------
+
+
+def handle_consulta_persona(interface, from_num: int, parts: list[str]) -> None:
+    """CONSULTA_P|<requestId>|<cedula>."""
+    if len(parts) < 3:
+        log.warning("CONSULTA_P formato inválido: %s", parts)
+        return
+    request_id, cedula = parts[1], parts[2]
+    log.info(
+        "🚶 CONSULTA_P req=%s cedula=%s de %s",
+        request_id, cedula, _node_hex(from_num),
+    )
+
+    try:
+        record = airtable_find_persona(cedula)
+        if record is None:
+            send_text(interface, from_num, f"RESPUESTA_P|{request_id}|NO_APROBADO")
+            return
+
+        fields = record.get("fields", {})
+        if not bool(fields.get("autorizado")):
+            send_text(interface, from_num, f"RESPUESTA_P|{request_id}|NO_APROBADO")
+            return
+
+        vence = fields.get("vence")
+        if vence:
+            try:
+                vence_date = date.fromisoformat(vence[:10])
+                if vence_date < date.today():
+                    log.info("Persona %s vencida (%s).", cedula, vence)
+                    send_text(interface, from_num,
+                              f"RESPUESTA_P|{request_id}|NO_APROBADO")
+                    return
+            except ValueError:
+                log.warning("Fecha de vencimiento inválida: %r", vence)
+
+        nombre = (fields.get("nombre") or "").strip()
+        send_text(interface, from_num,
+                  f"RESPUESTA_P|{request_id}|APROBADO|{nombre}")
+
+    except AirtableError as e:
+        log.error("AirtableError en CONSULTA_P: %s", e)
+        send_text(interface, from_num,
+                  f"RESPUESTA_P|{request_id}|ERROR|{str(e)[:50]}")
+    except Exception:
+        log.error("Excepción en CONSULTA_P:\n%s", traceback.format_exc())
+        send_text(interface, from_num, f"RESPUESTA_P|{request_id}|ERROR|interno")
+
+
+def handle_entrada_persona(interface, from_num: int, parts: list[str]) -> None:
+    """ENTRADA_P|<cedula>|<aprobadoPor>."""
+    if len(parts) < 3:
+        log.warning("ENTRADA_P formato inválido: %s", parts)
+        return
+    _, cedula, approved_by = parts[0], parts[1], parts[2]
+    log.info("🚶 ENTRADA_P cedula=%s aprobadoPor=%s", cedula, approved_by)
+
+    try:
+        record_id = airtable_create_registro(
+            {
+                "tipo": "ENTRADA",
+                "categoria": "PEATON",
+                "cedula": cedula,
+                "entry_time": _now_iso(),
+                "approved_by": approved_by,
+                "status": "APROBADO",
+                "nodo_origen": _node_hex(from_num),
+            }
+        )
+        log.info("✓ Entrada peatonal creada (record %s)", record_id)
+    except AirtableError as e:
+        log.error("AirtableError en ENTRADA_P: %s", e)
+    except Exception:
+        log.error("Excepción en ENTRADA_P:\n%s", traceback.format_exc())
+
+
+def handle_salida_persona(interface, from_num: int, parts: list[str]) -> None:
+    """SALIDA_P|<cedula>."""
+    if len(parts) < 2:
+        log.warning("SALIDA_P formato inválido: %s", parts)
+        return
+    cedula = parts[1]
+    log.info("🚪 SALIDA_P cedula=%s", cedula)
+
+    try:
+        record = airtable_find_active_person(cedula)
+        if record is None:
+            log.warning("No hay entrada peatonal activa para CC %s.", cedula)
+            airtable_create_registro(
+                {
+                    "tipo": "SALIDA",
+                    "categoria": "PEATON",
+                    "cedula": cedula,
+                    "exit_time": _now_iso(),
+                    "nodo_origen": _node_hex(from_num),
+                    "status": "SALIDA_SIN_ENTRADA",
+                }
+            )
+            return
+        airtable_update_registro(record["id"], {"exit_time": _now_iso()})
+        log.info("✓ Salida peatonal actualizada (record %s)", record["id"])
+    except AirtableError as e:
+        log.error("AirtableError en SALIDA_P: %s", e)
+    except Exception:
+        log.error("Excepción en SALIDA_P:\n%s", traceback.format_exc())
+
+
+def handle_registro_manual_persona(interface, from_num: int, parts: list[str]) -> None:
+    """REGISTRO_MANUAL_P|<status>|<cedula>|<supervisor>|<comment>."""
+    if len(parts) < 5:
+        log.warning("REGISTRO_MANUAL_P formato inválido: %s", parts)
+        return
+    status = parts[1]
+    cedula = parts[2]
+    supervisor = parts[3]
+    comment = parts[4] if len(parts) > 4 else ""
+
+    log.info(
+        "🚶 REGISTRO_MANUAL_P cedula=%s status=%s supervisor=%s",
+        cedula, status, supervisor,
+    )
+
+    try:
+        fields = {
+            "tipo": "ENTRADA" if status == "APROBADO" else "MANUAL",
+            "categoria": "PEATON",
+            "cedula": cedula,
+            "approved_by": supervisor,
+            "status": status,
+            "supervisor": supervisor,
+            "comment": comment,
+            "nodo_origen": _node_hex(from_num),
+        }
+        if status == "APROBADO":
+            fields["entry_time"] = _now_iso()
+        else:
+            fields["rejected_time"] = _now_iso()
+        record_id = airtable_create_registro(fields)
+        log.info("✓ Registro manual peatonal creado (record %s)", record_id)
+    except AirtableError as e:
+        log.error("AirtableError en REGISTRO_MANUAL_P: %s", e)
+    except Exception:
+        log.error("Excepción en REGISTRO_MANUAL_P:\n%s", traceback.format_exc())
+
+
+# Mapa prefijo → handler. on_receive hace exact match con dict.get(prefix),
+# no startswith, así que el orden no importa y no hay colisión entre
+# CONSULTA y CONSULTA_P (son keys distintas).
 HANDLERS = {
+    "CONSULTA_P": handle_consulta_persona,
+    "ENTRADA_P": handle_entrada_persona,
+    "SALIDA_P": handle_salida_persona,
+    "REGISTRO_MANUAL_P": handle_registro_manual_persona,
     "CONSULTA": handle_consulta,
     "ENTRADA_V": handle_entrada,
     "SALIDA_V": handle_salida,

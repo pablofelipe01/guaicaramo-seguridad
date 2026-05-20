@@ -14,6 +14,8 @@ const String _loraRegionKey = 'lora_region';
 const String _gatewayNodeIdKey = 'gateway_node_id';
 const String _vehicleEntriesKey = 'vehicle_entries';
 const String _vehicleRequestsKey = 'vehicle_requests';
+const String _personEntriesKey = 'person_entries';
+const String _personRequestsKey = 'person_requests';
 const String _messageHistoryKey = 'message_history';
 const String _lastSessionDateKey = 'last_session_date';
 const int _maxMessageHistory = 100;
@@ -129,28 +131,48 @@ class MeshtasticService extends ChangeNotifier {
   final List<VehicleRequest> _vehicleRequests = [];
   final List<VehicleEntry> _vehicleEntries = [];
 
-  // Consultas de placa en vuelo (Fase 3) — requestId -> Completer.
+  // Solicitudes y entradas de peatones
+  final List<PersonRequest> _personRequests = [];
+  final List<PersonEntry> _personEntries = [];
+
+  // Consultas en vuelo — requestId -> Completer.
   // ignore: unused_field
   final Map<String, Completer<PlateCheckResult>> _pendingPlateChecks = {};
+  final Map<String, Completer<PersonCheckResult>> _pendingPersonChecks = {};
 
   final _messageController = StreamController<ChatMessage>.broadcast();
   final _vehicleRequestController = StreamController<VehicleRequest>.broadcast();
   final _vehicleResponseController = StreamController<VehicleResponse>.broadcast();
+  final _personRequestController = StreamController<PersonRequest>.broadcast();
+  final _personResponseController = StreamController<PersonResponse>.broadcast();
   final _nodePositionController = StreamController<MeshNode>.broadcast();
 
   Stream<ChatMessage> get messageStream => _messageController.stream;
   Stream<VehicleRequest> get vehicleRequestStream => _vehicleRequestController.stream;
   Stream<VehicleResponse> get vehicleResponseStream => _vehicleResponseController.stream;
+  Stream<PersonRequest> get personRequestStream => _personRequestController.stream;
+  Stream<PersonResponse> get personResponseStream => _personResponseController.stream;
   Stream<MeshNode> get nodePositionStream => _nodePositionController.stream;
 
   List<VehicleRequest> get pendingRequests =>
       _vehicleRequests.where((r) => !r.isResponded).toList();
   List<VehicleRequest> get allRequests => List.unmodifiable(_vehicleRequests);
-  int get pendingRequestsCount => pendingRequests.length;
+
+  List<PersonRequest> get pendingPersonRequests =>
+      _personRequests.where((r) => !r.isResponded).toList();
+  List<PersonRequest> get allPersonRequests => List.unmodifiable(_personRequests);
+
+  /// Total combinado para el badge del tab Solicitudes.
+  int get pendingRequestsCount =>
+      pendingRequests.length + pendingPersonRequests.length;
 
   List<VehicleEntry> get activeEntries =>
       _vehicleEntries.where((v) => !v.hasExited).toList();
   List<VehicleEntry> get allEntries => List.unmodifiable(_vehicleEntries);
+
+  List<PersonEntry> get activePersonEntries =>
+      _personEntries.where((v) => !v.hasExited).toList();
+  List<PersonEntry> get allPersonEntries => List.unmodifiable(_personEntries);
 
   ConnectionStatus get status => _status;
   String get statusMessage => _statusMessage;
@@ -343,6 +365,26 @@ class MeshtasticService extends ChangeNotifier {
         }
       }
 
+      final personEntriesJson = prefs.getString(_personEntriesKey);
+      if (personEntriesJson != null) {
+        final decoded = jsonDecode(personEntriesJson) as List<dynamic>;
+        _personEntries.clear();
+        for (final item in decoded) {
+          _personEntries
+              .add(PersonEntry.fromJson(item as Map<String, dynamic>));
+        }
+      }
+
+      final personRequestsJson = prefs.getString(_personRequestsKey);
+      if (personRequestsJson != null) {
+        final decoded = jsonDecode(personRequestsJson) as List<dynamic>;
+        _personRequests.clear();
+        for (final item in decoded) {
+          _personRequests
+              .add(PersonRequest.fromJson(item as Map<String, dynamic>));
+        }
+      }
+
       final messagesJson = prefs.getString(_messageHistoryKey);
       if (messagesJson != null) {
         final decoded = jsonDecode(messagesJson) as List<dynamic>;
@@ -357,14 +399,19 @@ class MeshtasticService extends ChangeNotifier {
       final lastDateStr = prefs.getString(_lastSessionDateKey);
       final today = _dateKey(DateTime.now());
       if (lastDateStr != null && lastDateStr != today) {
-        final before = _vehicleEntries.length;
+        final beforeV = _vehicleEntries.length;
+        final beforeP = _personEntries.length;
         _vehicleEntries.removeWhere((v) => v.hasExited);
         _vehicleRequests.removeWhere((r) => r.isResponded);
+        _personEntries.removeWhere((v) => v.hasExited);
+        _personRequests.removeWhere((r) => r.isResponded);
         debugPrint(
-          '🗓️ [DAILY_CLEANUP] Cambio de día. Entradas: $before → ${_vehicleEntries.length}',
+          '🗓️ [DAILY_CLEANUP] Cambio de día. Vehículos: $beforeV → ${_vehicleEntries.length}, Peatones: $beforeP → ${_personEntries.length}',
         );
         await _saveVehicleEntries();
         await _saveVehicleRequests();
+        await _savePersonEntries();
+        await _savePersonRequests();
       }
       await prefs.setString(_lastSessionDateKey, today);
 
@@ -402,6 +449,28 @@ class MeshtasticService extends ChangeNotifier {
     }
   }
 
+  Future<void> _savePersonEntries() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final encoded =
+          jsonEncode(_personEntries.map((v) => v.toJson()).toList());
+      await prefs.setString(_personEntriesKey, encoded);
+    } catch (e) {
+      debugPrint('❌ [PERSIST] Error guardando peatones: $e');
+    }
+  }
+
+  Future<void> _savePersonRequests() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final encoded =
+          jsonEncode(_personRequests.map((r) => r.toJson()).toList());
+      await prefs.setString(_personRequestsKey, encoded);
+    } catch (e) {
+      debugPrint('❌ [PERSIST] Error guardando solicitudes peatones: $e');
+    }
+  }
+
   Future<void> _saveMessageHistory() async {
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -416,6 +485,8 @@ class MeshtasticService extends ChangeNotifier {
   Future<void> clearAllData() async {
     _vehicleEntries.clear();
     _vehicleRequests.clear();
+    _personEntries.clear();
+    _personRequests.clear();
     _messageHistory.clear();
     _nodesWithUnread.clear();
     _channelsWithUnread.clear();
@@ -429,6 +500,8 @@ class MeshtasticService extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_vehicleEntriesKey);
       await prefs.remove(_vehicleRequestsKey);
+      await prefs.remove(_personEntriesKey);
+      await prefs.remove(_personRequestsKey);
       await prefs.remove(_messageHistoryKey);
     } catch (e) {
       debugPrint('❌ [PERSIST] Error borrando datos: $e');
@@ -856,6 +929,153 @@ class MeshtasticService extends ChangeNotifier {
     return sendChatMessage(message, destinationId: currentGatewayNodeId);
   }
 
+  // ---------- Peatones (paralelo a vehículos) ----------
+
+  /// Consulta al gateway si una persona está autorizada.
+  /// Envía `CONSULTA_P|<requestId>|<cedula>` y espera `RESPUESTA_P|...`.
+  Future<PersonCheckResult> checkPersonWithGateway({
+    required String cedula,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    if (!isConnected || _client == null) {
+      return PersonCheckResult(
+        status: PlateCheckStatus.error,
+        note: 'Sin conexión al nodo',
+      );
+    }
+
+    final requestId = DateTime.now().millisecondsSinceEpoch.toString();
+    final completer = Completer<PersonCheckResult>();
+    _pendingPersonChecks[requestId] = completer;
+
+    final message = 'CONSULTA_P|$requestId|$cedula';
+    debugPrint('🚶 [PERSON] CONSULTA_P → gateway: $message');
+    final sent =
+        await sendChatMessage(message, destinationId: currentGatewayNodeId);
+
+    if (!sent) {
+      _pendingPersonChecks.remove(requestId);
+      return PersonCheckResult(
+        status: PlateCheckStatus.error,
+        note: 'No se pudo enviar al gateway',
+      );
+    }
+
+    Future.delayed(timeout, () {
+      final pending = _pendingPersonChecks.remove(requestId);
+      if (pending != null && !pending.isCompleted) {
+        debugPrint('⏰ [PERSON] Timeout consulta $requestId');
+        pending.complete(PersonCheckResult(status: PlateCheckStatus.timeout));
+      }
+    });
+
+    return completer.future;
+  }
+
+  /// `SOLICITUD_P|<cedula>` como DM al supervisor.
+  Future<bool> requestPersonApproval({
+    required String cedula,
+    required int supervisorNodeId,
+  }) async {
+    final message = 'SOLICITUD_P|$cedula';
+    debugPrint(
+      '🚶 [PERSON] SOLICITUD_P → 0x${supervisorNodeId.toRadixString(16)}: $message',
+    );
+    return sendChatMessage(message, destinationId: supervisorNodeId);
+  }
+
+  /// Supervisor responde a una solicitud de peatón.
+  Future<bool> respondToPersonRequest({
+    required PersonRequest request,
+    required String status, // APROBADO, NEGADO, PENDIENTE
+    required String supervisorName,
+    String? comment,
+  }) async {
+    if (!isConnected || _client == null) return false;
+
+    // Sufijo _P para distinguir de respuestas de vehículos.
+    final body = comment != null && comment.isNotEmpty
+        ? '${status}_P|$supervisorName|$comment'
+        : '${status}_P|$supervisorName';
+
+    debugPrint(
+      '🚶 [PERSON] ${status}_P → 0x${request.fromNodeId.toRadixString(16)}: $body',
+    );
+    final sent = await sendChatMessage(body, destinationId: request.fromNodeId);
+    if (!sent) return false;
+
+    for (final r in _personRequests) {
+      if (r.requestId == request.requestId) {
+        r.isResponded = true;
+        r.responseStatus = status;
+        r.supervisorName = supervisorName;
+        r.comment = (comment != null && comment.isNotEmpty) ? comment : null;
+        break;
+      }
+    }
+    await _savePersonRequests();
+    notifyListeners();
+    return true;
+  }
+
+  void addPersonEntry({
+    required String cedula,
+    required String nombre,
+    required String approvedBy,
+  }) {
+    _personEntries.add(PersonEntry(
+      cedula: cedula,
+      nombre: nombre,
+      entryTime: DateTime.now(),
+      approvedBy: approvedBy,
+    ));
+    debugPrint('🚶 [PERSON] Entrada: $nombre ($cedula)');
+    _savePersonEntries();
+    notifyListeners();
+  }
+
+  void markPersonExited(String cedula) {
+    for (final entry in _personEntries) {
+      if (entry.cedula == cedula && !entry.hasExited) {
+        entry.exitTime = DateTime.now();
+        debugPrint('🚶 [PERSON] Salida: $cedula');
+        _savePersonEntries();
+        notifyListeners();
+        return;
+      }
+    }
+  }
+
+  /// `ENTRADA_P|<cedula>|<aprobadoPor>` al gateway.
+  Future<bool> sendPersonEntryToGateway({
+    required String cedula,
+    required String approvedBy,
+  }) async {
+    final message = 'ENTRADA_P|$cedula|$approvedBy';
+    debugPrint('🚶 [PERSON] ENTRADA_P → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
+  /// `SALIDA_P|<cedula>` al gateway.
+  Future<bool> sendPersonExitToGateway({required String cedula}) async {
+    final message = 'SALIDA_P|$cedula';
+    debugPrint('🚶 [PERSON] SALIDA_P → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
+  /// `REGISTRO_MANUAL_P|<status>|<cedula>|<supervisor>|<comment>` al gateway.
+  Future<bool> sendRegistroManualPersonToGateway({
+    required String status,
+    required String cedula,
+    required String supervisor,
+    String? comment,
+  }) async {
+    final message =
+        'REGISTRO_MANUAL_P|$status|$cedula|$supervisor|${comment ?? ''}';
+    debugPrint('🚶 [PERSON] REGISTRO_MANUAL_P → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
   /// Registra entrada en el estado local (y dispara envío al gateway).
   void addVehicleEntry({
     required String cedula,
@@ -993,6 +1213,91 @@ class MeshtasticService extends ChangeNotifier {
       }
 
       // ---------- Protocolo Guaicaramo ----------
+
+      // RESPUESTA_P del gateway a una consulta de peatón.
+      // Debe chequearse ANTES de RESPUESTA| (prefijos comparten texto).
+      if (text.startsWith('RESPUESTA_P|')) {
+        final parts = text.split('|');
+        if (parts.length >= 3) {
+          final requestId = parts[1];
+          final statusStr = parts[2];
+          final completer = _pendingPersonChecks.remove(requestId);
+          debugPrint(
+            '🚶 [PERSON] RESPUESTA_P $requestId → $statusStr (pendiente: ${completer != null})',
+          );
+          if (completer != null && !completer.isCompleted) {
+            PersonCheckResult result;
+            switch (statusStr) {
+              case 'APROBADO':
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.approved,
+                  personName: parts.length > 3 ? parts[3] : null,
+                );
+                break;
+              case 'NO_APROBADO':
+                result =
+                    PersonCheckResult(status: PlateCheckStatus.notApproved);
+                break;
+              case 'ERROR':
+              default:
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.error,
+                  note: parts.length > 3 ? parts[3] : null,
+                );
+                break;
+            }
+            completer.complete(result);
+          }
+        }
+        _markPacketProcessed(packetId);
+        return;
+      }
+
+      // SOLICITUD_P — supervisor recibe pedido para peatón.
+      if (text.startsWith('SOLICITUD_P|')) {
+        final parts = text.split('|');
+        if (parts.length >= 2) {
+          final request = PersonRequest(
+            requestId: DateTime.now().millisecondsSinceEpoch,
+            cedula: parts[1],
+            fromNodeId: fromNodeId,
+            fromNodeName: fromName,
+            timestamp: DateTime.now(),
+          );
+          debugPrint('🚶 [PERSON] SOLICITUD_P CC ${parts[1]} de $fromName');
+          _personRequests.add(request);
+          _personRequestController.add(request);
+          _savePersonRequests();
+          notifyListeners();
+        }
+        _markPacketProcessed(packetId);
+        return;
+      }
+
+      // Respuestas del supervisor para peatones (DM al portero).
+      // Chequear ANTES de APROBADO|/NEGADO|/PENDIENTE| de vehículos.
+      if (text.startsWith('APROBADO_P|') ||
+          text.startsWith('NEGADO_P|') ||
+          text.startsWith('PENDIENTE_P|')) {
+        final parts = text.split('|');
+        if (parts.length >= 2) {
+          // Quitar sufijo _P para tener el status crudo.
+          final rawStatus = parts[0].substring(0, parts[0].length - 2);
+          final response = PersonResponse(
+            status: rawStatus,
+            supervisorName: parts[1],
+            comment: parts.length > 2 ? parts[2] : null,
+            fromNodeId: fromNodeId,
+            timestamp: DateTime.now(),
+          );
+          debugPrint(
+            '🚶 [PERSON] Respuesta $rawStatus de ${parts[1]}',
+          );
+          _personResponseController.add(response);
+        }
+        _markPacketProcessed(packetId);
+        return;
+      }
 
       // RESPUESTA del gateway a una consulta de placa.
       if (text.startsWith('RESPUESTA|')) {
@@ -1262,6 +1567,8 @@ class MeshtasticService extends ChangeNotifier {
     _messageController.close();
     _vehicleRequestController.close();
     _vehicleResponseController.close();
+    _personRequestController.close();
+    _personResponseController.close();
     _nodePositionController.close();
     _client?.disconnect();
     super.dispose();

@@ -67,5 +67,6 @@ adb install -r versiones/guaicaramo_control_0.1.0_2026-05-20.apk
 |---|---|---|---|
 | 0.1.0 | 2026-05-20 | `guaicaramo_control_0.1.0_2026-05-20.apk` | Primer release: chat, recepción, mapa offline, gateway Airtable. |
 | 0.1.1 | 2026-05-20 | `guaicaramo_control_0.1.1_2026-05-20_fix-gateway-id.apk` | Fix: gateway por defecto cambiado a `!9ea29bc4` (Heltec V3 de Guaicaramo). Limpieza de nodos preloaded de sirius_porteria. |
+| 0.2.0 | 2026-05-20 | `guaicaramo_control_0.2.0_2026-05-20_peatones.apk` | **Peatones**: toggle Vehículo/Peatón en Recepción. Nueva tabla `Personas` en Airtable. Protocolo `CONSULTA_P`, `ENTRADA_P`, `SALIDA_P`, `REGISTRO_MANUAL_P` y respuestas `APROBADO_P`/`NEGADO_P`/`PENDIENTE_P`. RequestsScreen mezcla ambos tipos. |
 
 Agrega filas a esta tabla con cada release.

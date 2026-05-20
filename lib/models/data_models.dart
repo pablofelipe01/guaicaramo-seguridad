@@ -329,6 +329,165 @@ class VehicleResponse {
   bool get isPending => status == 'PENDIENTE';
 }
 
+// ============================================================================
+// Peatones — paralelo a vehículos. Comparten estructura pero protocolo distinto.
+// ============================================================================
+
+/// Persona que entró a pie (sin vehículo). Paralelo a [VehicleEntry].
+class PersonEntry {
+  final String cedula;
+  final String nombre;
+  final DateTime entryTime;
+  DateTime? exitTime;
+  final String approvedBy;
+
+  PersonEntry({
+    required this.cedula,
+    required this.nombre,
+    required this.entryTime,
+    required this.approvedBy,
+    this.exitTime,
+  });
+
+  bool get hasExited => exitTime != null;
+
+  String get formattedEntryTime {
+    final hour = entryTime.hour.toString().padLeft(2, '0');
+    final minute = entryTime.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+
+  String? get formattedExitTime {
+    if (exitTime == null) return null;
+    final hour = exitTime!.hour.toString().padLeft(2, '0');
+    final minute = exitTime!.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+
+  Map<String, dynamic> toJson() => {
+        'cedula': cedula,
+        'nombre': nombre,
+        'entryTime': entryTime.toIso8601String(),
+        'exitTime': exitTime?.toIso8601String(),
+        'approvedBy': approvedBy,
+      };
+
+  factory PersonEntry.fromJson(Map<String, dynamic> json) {
+    final v = PersonEntry(
+      cedula: json['cedula'] as String,
+      nombre: json['nombre'] as String? ?? '',
+      entryTime: DateTime.parse(json['entryTime'] as String),
+      approvedBy: json['approvedBy'] as String? ?? 'GATEWAY',
+    );
+    if (json['exitTime'] != null) {
+      v.exitTime = DateTime.parse(json['exitTime'] as String);
+    }
+    return v;
+  }
+}
+
+/// Solicitud de aprobación manual al supervisor para un peatón.
+/// Paralelo a [VehicleRequest].
+class PersonRequest {
+  final int requestId;
+  final String cedula;
+  final int fromNodeId;
+  final String fromNodeName;
+  final DateTime timestamp;
+  bool isResponded;
+  String? responseStatus;
+  String? supervisorName;
+  String? comment;
+
+  PersonRequest({
+    required this.requestId,
+    required this.cedula,
+    required this.fromNodeId,
+    required this.fromNodeName,
+    required this.timestamp,
+    this.isResponded = false,
+    this.responseStatus,
+    this.supervisorName,
+    this.comment,
+  });
+
+  String get formattedTime {
+    final hour = timestamp.hour.toString().padLeft(2, '0');
+    final minute = timestamp.minute.toString().padLeft(2, '0');
+    return '$hour:$minute';
+  }
+
+  String get formattedDate {
+    final day = timestamp.day.toString().padLeft(2, '0');
+    final month = timestamp.month.toString().padLeft(2, '0');
+    return '$day/$month';
+  }
+
+  Map<String, dynamic> toJson() => {
+        'requestId': requestId,
+        'cedula': cedula,
+        'fromNodeId': fromNodeId,
+        'fromNodeName': fromNodeName,
+        'timestamp': timestamp.toIso8601String(),
+        'isResponded': isResponded,
+        'responseStatus': responseStatus,
+        'supervisorName': supervisorName,
+        'comment': comment,
+      };
+
+  factory PersonRequest.fromJson(Map<String, dynamic> json) => PersonRequest(
+        requestId: json['requestId'] as int,
+        cedula: json['cedula'] as String,
+        fromNodeId: json['fromNodeId'] as int,
+        fromNodeName: json['fromNodeName'] as String,
+        timestamp: DateTime.parse(json['timestamp'] as String),
+        isResponded: json['isResponded'] as bool? ?? false,
+        responseStatus: json['responseStatus'] as String?,
+        supervisorName: json['supervisorName'] as String?,
+        comment: json['comment'] as String?,
+      );
+}
+
+/// Resultado de [MeshtasticService.checkPersonWithGateway].
+/// Paralelo a [PlateCheckResult] pero con el nombre del titular.
+class PersonCheckResult {
+  final PlateCheckStatus status;
+  final String? personName;
+  final String? note;
+
+  PersonCheckResult({
+    required this.status,
+    this.personName,
+    this.note,
+  });
+
+  bool get isApproved => status == PlateCheckStatus.approved;
+  bool get isNotApproved => status == PlateCheckStatus.notApproved;
+  bool get isTimeout => status == PlateCheckStatus.timeout;
+  bool get isError => status == PlateCheckStatus.error;
+}
+
+/// Respuesta del supervisor a un [PersonRequest].
+class PersonResponse {
+  final String status;
+  final String supervisorName;
+  final String? comment;
+  final int fromNodeId;
+  final DateTime timestamp;
+
+  PersonResponse({
+    required this.status,
+    required this.supervisorName,
+    this.comment,
+    required this.fromNodeId,
+    required this.timestamp,
+  });
+
+  bool get isApproved => status == 'APROBADO';
+  bool get isDenied => status == 'NEGADO';
+  bool get isPending => status == 'PENDIENTE';
+}
+
 class ChatDestination {
   final String displayName;
   final int? channel;

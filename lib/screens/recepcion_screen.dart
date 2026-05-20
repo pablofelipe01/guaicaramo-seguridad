@@ -4,14 +4,15 @@ import 'package:flutter/services.dart';
 import '../models/data_models.dart';
 import '../services/meshtastic_service.dart';
 
-/// Estado de la pantalla de recepción.
+enum _AccessMode { vehiculo, peaton }
+
 enum _RecepcionStage {
-  idle, // formulario CC + Placa
-  checking, // consultando gateway
-  approvedByGateway, // ok automático
-  notApproved, // gateway dijo no; seleccionar supervisor
-  waitingSupervisor, // esperando respuesta del supervisor
-  approvedBySupervisor, // supervisor aprobó manualmente
+  idle,
+  checking,
+  approvedByGateway,
+  notApproved,
+  waitingSupervisor,
+  approvedBySupervisor,
   deniedBySupervisor,
   pendingFromSupervisor,
   error,
@@ -30,14 +31,21 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   final _formKey = GlobalKey<FormState>();
   final _cedulaController = TextEditingController();
   final _placaController = TextEditingController();
+  final _nombreController = TextEditingController();
 
+  _AccessMode _mode = _AccessMode.vehiculo;
   _RecepcionStage _stage = _RecepcionStage.idle;
-  PlateCheckResult? _lastCheck;
-  VehicleResponse? _lastResponse;
+
+  // Resultados de la última consulta
+  PlateCheckResult? _lastPlateCheck;
+  PersonCheckResult? _lastPersonCheck;
+  VehicleResponse? _lastVehicleResponse;
+  PersonResponse? _lastPersonResponse;
   MeshNode? _selectedSupervisor;
   String? _errorMessage;
 
-  StreamSubscription<VehicleResponse>? _responseSubscription;
+  StreamSubscription<VehicleResponse>? _vehicleResponseSubscription;
+  StreamSubscription<PersonResponse>? _personResponseSubscription;
   Timer? _supervisorTimeoutTimer;
 
   MeshtasticService get _service => widget.meshtasticService;
@@ -46,17 +54,21 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   void initState() {
     super.initState();
     _service.addListener(_onServiceChange);
-    _responseSubscription =
-        _service.vehicleResponseStream.listen(_onSupervisorResponse);
+    _vehicleResponseSubscription =
+        _service.vehicleResponseStream.listen(_onSupervisorVehicleResponse);
+    _personResponseSubscription =
+        _service.personResponseStream.listen(_onSupervisorPersonResponse);
   }
 
   @override
   void dispose() {
     _service.removeListener(_onServiceChange);
-    _responseSubscription?.cancel();
+    _vehicleResponseSubscription?.cancel();
+    _personResponseSubscription?.cancel();
     _supervisorTimeoutTimer?.cancel();
     _cedulaController.dispose();
     _placaController.dispose();
+    _nombreController.dispose();
     super.dispose();
   }
 
@@ -67,18 +79,24 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   void _resetForm() {
     setState(() {
       _stage = _RecepcionStage.idle;
-      _lastCheck = null;
-      _lastResponse = null;
+      _lastPlateCheck = null;
+      _lastPersonCheck = null;
+      _lastVehicleResponse = null;
+      _lastPersonResponse = null;
       _selectedSupervisor = null;
       _errorMessage = null;
       _cedulaController.clear();
       _placaController.clear();
+      _nombreController.clear();
     });
     _supervisorTimeoutTimer?.cancel();
   }
 
   String get _cedula => _cedulaController.text.trim();
   String get _placa => _placaController.text.trim().toUpperCase();
+  String get _nombre => _nombreController.text.trim();
+
+  bool get _isVehicle => _mode == _AccessMode.vehiculo;
 
   Future<void> _verify() async {
     if (!_formKey.currentState!.validate()) return;
@@ -92,48 +110,76 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _errorMessage = null;
     });
 
-    final result = await _service.checkPlateWithGateway(
-      cedula: _cedula,
-      placa: _placa,
-    );
-
-    if (!mounted) return;
-
-    setState(() {
-      _lastCheck = result;
-      switch (result.status) {
-        case PlateCheckStatus.approved:
-          _stage = _RecepcionStage.approvedByGateway;
-          break;
-        case PlateCheckStatus.notApproved:
-          _stage = _RecepcionStage.notApproved;
-          break;
-        case PlateCheckStatus.timeout:
-          _stage = _RecepcionStage.error;
+    if (_isVehicle) {
+      final result = await _service.checkPlateWithGateway(
+        cedula: _cedula,
+        placa: _placa,
+      );
+      if (!mounted) return;
+      setState(() {
+        _lastPlateCheck = result;
+        _stage = _stageFromStatus(result.status);
+        if (result.isTimeout) {
           _errorMessage =
               'El gateway no respondió a tiempo. Verifica conexión LoRa.';
-          break;
-        case PlateCheckStatus.error:
-          _stage = _RecepcionStage.error;
+        } else if (result.isError) {
           _errorMessage = result.note ?? 'Error consultando el gateway.';
-          break;
-      }
-    });
+        }
+      });
+    } else {
+      final result = await _service.checkPersonWithGateway(cedula: _cedula);
+      if (!mounted) return;
+      setState(() {
+        _lastPersonCheck = result;
+        _stage = _stageFromStatus(result.status);
+        if (result.isTimeout) {
+          _errorMessage =
+              'El gateway no respondió a tiempo. Verifica conexión LoRa.';
+        } else if (result.isError) {
+          _errorMessage = result.note ?? 'Error consultando el gateway.';
+        }
+      });
+    }
+  }
+
+  _RecepcionStage _stageFromStatus(PlateCheckStatus status) {
+    switch (status) {
+      case PlateCheckStatus.approved:
+        return _RecepcionStage.approvedByGateway;
+      case PlateCheckStatus.notApproved:
+        return _RecepcionStage.notApproved;
+      case PlateCheckStatus.timeout:
+      case PlateCheckStatus.error:
+        return _RecepcionStage.error;
+    }
   }
 
   Future<void> _registerEntryFromGateway() async {
-    final approvedBy = 'GATEWAY';
-    _service.addVehicleEntry(
-      cedula: _cedula,
-      placa: _placa,
-      approvedBy: approvedBy,
-    );
-    await _service.sendEntryToGateway(
-      cedula: _cedula,
-      placa: _placa,
-      approvedBy: approvedBy,
-    );
-    _showSnack('Entrada registrada: $_placa');
+    if (_isVehicle) {
+      _service.addVehicleEntry(
+        cedula: _cedula,
+        placa: _placa,
+        approvedBy: 'GATEWAY',
+      );
+      await _service.sendEntryToGateway(
+        cedula: _cedula,
+        placa: _placa,
+        approvedBy: 'GATEWAY',
+      );
+      _showSnack('Entrada registrada: $_placa');
+    } else {
+      final nombre = _lastPersonCheck?.personName ?? _nombre;
+      _service.addPersonEntry(
+        cedula: _cedula,
+        nombre: nombre,
+        approvedBy: 'GATEWAY',
+      );
+      await _service.sendPersonEntryToGateway(
+        cedula: _cedula,
+        approvedBy: 'GATEWAY',
+      );
+      _showSnack('Entrada registrada: $nombre');
+    }
     _resetForm();
   }
 
@@ -146,11 +192,16 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
 
     setState(() => _stage = _RecepcionStage.waitingSupervisor);
 
-    final sent = await _service.requestVehicleApproval(
-      cedula: _cedula,
-      placa: _placa,
-      supervisorNodeId: supervisor.nodeId,
-    );
+    final sent = _isVehicle
+        ? await _service.requestVehicleApproval(
+            cedula: _cedula,
+            placa: _placa,
+            supervisorNodeId: supervisor.nodeId,
+          )
+        : await _service.requestPersonApproval(
+            cedula: _cedula,
+            supervisorNodeId: supervisor.nodeId,
+          );
 
     if (!mounted) return;
 
@@ -162,7 +213,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       return;
     }
 
-    // El supervisor puede tardar varios minutos. Timeout de 5 min para limpiar la espera.
     _supervisorTimeoutTimer?.cancel();
     _supervisorTimeoutTimer = Timer(const Duration(minutes: 5), () {
       if (!mounted) return;
@@ -175,11 +225,12 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     });
   }
 
-  void _onSupervisorResponse(VehicleResponse response) {
+  void _onSupervisorVehicleResponse(VehicleResponse response) {
+    if (!_isVehicle) return;
     if (_stage != _RecepcionStage.waitingSupervisor) return;
     _supervisorTimeoutTimer?.cancel();
     setState(() {
-      _lastResponse = response;
+      _lastVehicleResponse = response;
       if (response.isApproved) {
         _stage = _RecepcionStage.approvedBySupervisor;
       } else if (response.isDenied) {
@@ -213,6 +264,43 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     }
   }
 
+  void _onSupervisorPersonResponse(PersonResponse response) {
+    if (_isVehicle) return;
+    if (_stage != _RecepcionStage.waitingSupervisor) return;
+    _supervisorTimeoutTimer?.cancel();
+    setState(() {
+      _lastPersonResponse = response;
+      if (response.isApproved) {
+        _stage = _RecepcionStage.approvedBySupervisor;
+      } else if (response.isDenied) {
+        _stage = _RecepcionStage.deniedBySupervisor;
+      } else {
+        _stage = _RecepcionStage.pendingFromSupervisor;
+      }
+    });
+
+    if (response.isApproved) {
+      _service.addPersonEntry(
+        cedula: _cedula,
+        nombre: _nombre.isNotEmpty ? _nombre : '(sin nombre)',
+        approvedBy: response.supervisorName,
+      );
+      _service.sendRegistroManualPersonToGateway(
+        status: 'APROBADO',
+        cedula: _cedula,
+        supervisor: response.supervisorName,
+        comment: response.comment,
+      );
+    } else if (response.isDenied) {
+      _service.sendRegistroManualPersonToGateway(
+        status: 'NEGADO',
+        cedula: _cedula,
+        supervisor: response.supervisorName,
+        comment: response.comment,
+      );
+    }
+  }
+
   void _showSnack(String message) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
@@ -222,6 +310,16 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     if (sent) {
       _service.markVehicleExited(entry.placa);
       _showSnack('Salida registrada: ${entry.placa}');
+    } else {
+      _showSnack('Error al registrar salida');
+    }
+  }
+
+  Future<void> _registerPersonExit(PersonEntry entry) async {
+    final sent = await _service.sendPersonExitToGateway(cedula: entry.cedula);
+    if (sent) {
+      _service.markPersonExited(entry.cedula);
+      _showSnack('Salida registrada: ${entry.nombre}');
     } else {
       _showSnack('Error al registrar salida');
     }
@@ -252,6 +350,34 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     return Icon(icon, color: color, size: 22);
   }
 
+  Widget _buildModeToggle() {
+    return SegmentedButton<_AccessMode>(
+      segments: const [
+        ButtonSegment(
+          value: _AccessMode.vehiculo,
+          icon: Icon(Icons.directions_car),
+          label: Text('Vehículo'),
+        ),
+        ButtonSegment(
+          value: _AccessMode.peaton,
+          icon: Icon(Icons.directions_walk),
+          label: Text('Peatón'),
+        ),
+      ],
+      selected: {_mode},
+      onSelectionChanged: (s) {
+        if (_stage != _RecepcionStage.idle &&
+            _stage != _RecepcionStage.checking) {
+          return;
+        }
+        setState(() {
+          _mode = s.first;
+          _resetForm();
+        });
+      },
+    );
+  }
+
   Widget _buildForm() {
     return Form(
       key: _formKey,
@@ -273,29 +399,40 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             },
           ),
           const SizedBox(height: 12),
-          TextFormField(
-            controller: _placaController,
-            textCapitalization: TextCapitalization.characters,
-            inputFormatters: [
-              FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9]')),
-              LengthLimitingTextInputFormatter(8),
-              TextInputFormatter.withFunction(
-                (oldValue, newValue) => newValue.copyWith(
-                  text: newValue.text.toUpperCase(),
+          if (_isVehicle)
+            TextFormField(
+              controller: _placaController,
+              textCapitalization: TextCapitalization.characters,
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9]')),
+                LengthLimitingTextInputFormatter(8),
+                TextInputFormatter.withFunction(
+                  (oldValue, newValue) => newValue.copyWith(
+                    text: newValue.text.toUpperCase(),
+                  ),
                 ),
+              ],
+              decoration: const InputDecoration(
+                labelText: 'Placa',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.directions_car),
               ),
-            ],
-            decoration: const InputDecoration(
-              labelText: 'Placa',
-              border: OutlineInputBorder(),
-              prefixIcon: Icon(Icons.directions_car),
+              validator: (v) {
+                if (v == null || v.trim().isEmpty) return 'Ingresa la placa';
+                if (v.trim().length < 4) return 'Placa muy corta';
+                return null;
+              },
+            )
+          else
+            TextFormField(
+              controller: _nombreController,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(
+                labelText: 'Nombre (opcional, solo para aprobación manual)',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.person),
+              ),
             ),
-            validator: (v) {
-              if (v == null || v.trim().isEmpty) return 'Ingresa la placa';
-              if (v.trim().length < 4) return 'Placa muy corta';
-              return null;
-            },
-          ),
           const SizedBox(height: 20),
           ElevatedButton.icon(
             onPressed: _stage == _RecepcionStage.checking || !_service.isConnected
@@ -312,6 +449,19 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         ],
       ),
     );
+  }
+
+  String get _approvedSubtitle {
+    if (_isVehicle) {
+      final driver = _lastPlateCheck?.driverName;
+      return (driver != null && driver.isNotEmpty)
+          ? 'Conductor: $driver'
+          : 'Placa $_placa autorizada';
+    }
+    final person = _lastPersonCheck?.personName;
+    return (person != null && person.isNotEmpty)
+        ? 'Persona: $person'
+        : 'CC $_cedula autorizada';
   }
 
   Widget _buildStatusCard() {
@@ -348,10 +498,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           icon: Icons.check_circle,
           color: Colors.green,
           title: 'AUTORIZADO',
-          subtitle: _lastCheck?.driverName != null &&
-                  _lastCheck!.driverName!.isNotEmpty
-              ? 'Conductor: ${_lastCheck!.driverName}'
-              : 'Placa $_placa autorizada',
+          subtitle: _approvedSubtitle,
           primaryButton: ElevatedButton.icon(
             onPressed: _registerEntryFromGateway,
             icon: const Icon(Icons.login),
@@ -399,33 +546,53 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         );
 
       case _RecepcionStage.approvedBySupervisor:
+        final supName = _isVehicle
+            ? _lastVehicleResponse?.supervisorName ?? ''
+            : _lastPersonResponse?.supervisorName ?? '';
+        final comment = _isVehicle
+            ? _lastVehicleResponse?.comment
+            : _lastPersonResponse?.comment;
         return _ResultCard(
           icon: Icons.check_circle,
           color: Colors.green,
           title: 'APROBADO',
-          subtitle: 'Por: ${_lastResponse?.supervisorName ?? ""}',
-          comment: _lastResponse?.comment,
-          info: 'Vehículo registrado en la lista de abajo.',
+          subtitle: 'Por: $supName',
+          comment: comment,
+          info: _isVehicle
+              ? 'Vehículo registrado en la lista de abajo.'
+              : 'Peatón registrado en la lista de abajo.',
           onReset: _resetForm,
         );
 
       case _RecepcionStage.deniedBySupervisor:
+        final supName = _isVehicle
+            ? _lastVehicleResponse?.supervisorName ?? ''
+            : _lastPersonResponse?.supervisorName ?? '';
+        final comment = _isVehicle
+            ? _lastVehicleResponse?.comment
+            : _lastPersonResponse?.comment;
         return _ResultCard(
           icon: Icons.cancel,
           color: Colors.red,
           title: 'NEGADO',
-          subtitle: 'Por: ${_lastResponse?.supervisorName ?? ""}',
-          comment: _lastResponse?.comment,
+          subtitle: 'Por: $supName',
+          comment: comment,
           onReset: _resetForm,
         );
 
       case _RecepcionStage.pendingFromSupervisor:
+        final supName = _isVehicle
+            ? _lastVehicleResponse?.supervisorName ?? ''
+            : _lastPersonResponse?.supervisorName ?? '';
+        final comment = _isVehicle
+            ? _lastVehicleResponse?.comment
+            : _lastPersonResponse?.comment;
         return _ResultCard(
           icon: Icons.pending,
           color: Colors.orange,
           title: 'PENDIENTE',
-          subtitle: 'Por: ${_lastResponse?.supervisorName ?? ""}',
-          comment: _lastResponse?.comment,
+          subtitle: 'Por: $supName',
+          comment: comment,
           info: 'El supervisor pidió tiempo. Repite la consulta más tarde.',
           onReset: _resetForm,
         );
@@ -455,6 +622,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     final supervisors = _service.onlineNodes
         .where((n) => n.nodeId != _service.currentGatewayNodeId)
         .toList();
+    final label = _isVehicle
+        ? 'La placa $_placa no está en la lista.'
+        : 'La cédula $_cedula no está en la lista de personas.';
 
     return Card(
       color: Colors.orange.shade50,
@@ -468,18 +638,20 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
               children: [
                 const Icon(Icons.warning_amber, color: Colors.orange, size: 32),
                 const SizedBox(width: 12),
-                const Expanded(
+                Expanded(
                   child: Text(
-                    'Placa no autorizada',
-                    style:
-                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    _isVehicle ? 'Placa no autorizada' : 'Persona no autorizada',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 8),
             Text(
-              'La placa $_placa no está en la lista. Solicita aprobación manual a un supervisor.',
+              '$label Solicita aprobación manual a un supervisor.',
               style: const TextStyle(fontSize: 14),
             ),
             const SizedBox(height: 16),
@@ -516,8 +688,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
               ),
             const SizedBox(height: 16),
             ElevatedButton.icon(
-              onPressed:
-                  _selectedSupervisor == null ? null : _requestSupervisorApproval,
+              onPressed: _selectedSupervisor == null
+                  ? null
+                  : _requestSupervisorApproval,
               icon: const Icon(Icons.send),
               label: const Text('Solicitar Aprobación Manual'),
               style: ElevatedButton.styleFrom(
@@ -536,13 +709,15 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     );
   }
 
-  Widget _buildActiveVehicles() {
-    final all = _service.allEntries;
-    if (all.isEmpty) return const SizedBox.shrink();
+  Widget _buildActiveList() {
+    final vehicleAll = _service.allEntries;
+    final personAll = _service.allPersonEntries;
+    if (vehicleAll.isEmpty && personAll.isEmpty) return const SizedBox.shrink();
 
-    final active = all.where((v) => !v.hasExited).toList();
-    final exited = all.where((v) => v.hasExited).toList();
-    final sorted = [...active.reversed, ...exited.reversed];
+    final vehiclesActive = vehicleAll.where((v) => !v.hasExited).toList();
+    final vehiclesExited = vehicleAll.where((v) => v.hasExited).toList();
+    final personsActive = personAll.where((v) => !v.hasExited).toList();
+    final personsExited = personAll.where((v) => v.hasExited).toList();
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -550,16 +725,19 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         const Divider(height: 32),
         Row(
           children: [
-            const Icon(Icons.directions_car, size: 20),
+            const Icon(Icons.list, size: 20),
             const SizedBox(width: 8),
             Text(
-              'Vehículos (${active.length} activos)',
+              'Activos: ${vehiclesActive.length} 🚗 · ${personsActive.length} 🚶',
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
           ],
         ),
         const SizedBox(height: 8),
-        ...sorted.map(_buildVehicleCard),
+        ...vehiclesActive.reversed.map(_buildVehicleCard),
+        ...personsActive.reversed.map(_buildPersonCard),
+        ...vehiclesExited.reversed.map(_buildVehicleCard),
+        ...personsExited.reversed.map(_buildPersonCard),
       ],
     );
   }
@@ -593,14 +771,12 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                   ),
                   Text(
                     'CC ${entry.cedula} • ${entry.approvedBy}',
-                    style:
-                        TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
                   ),
                   Text(
                     'Entrada: ${entry.formattedEntryTime}'
                     '${entry.hasExited ? "  •  Salida: ${entry.formattedExitTime}" : ""}',
-                    style:
-                        TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
                   ),
                 ],
               ),
@@ -608,6 +784,65 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             if (!entry.hasExited)
               ElevatedButton.icon(
                 onPressed: () => _registerVehicleExit(entry),
+                icon: const Icon(Icons.logout, size: 18),
+                label: const Text('Salida'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blue,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPersonCard(PersonEntry entry) {
+    return Card(
+      elevation: 2,
+      color: entry.hasExited ? Colors.grey.shade100 : Colors.purple.shade50,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          children: [
+            Icon(
+              entry.hasExited ? Icons.logout : Icons.directions_walk,
+              color: entry.hasExited ? Colors.grey : Colors.purple,
+              size: 28,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    entry.nombre,
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                      decoration:
+                          entry.hasExited ? TextDecoration.lineThrough : null,
+                    ),
+                  ),
+                  Text(
+                    'CC ${entry.cedula} • ${entry.approvedBy}',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                  Text(
+                    'Entrada: ${entry.formattedEntryTime}'
+                    '${entry.hasExited ? "  •  Salida: ${entry.formattedExitTime}" : ""}',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                ],
+              ),
+            ),
+            if (!entry.hasExited)
+              ElevatedButton.icon(
+                onPressed: () => _registerPersonExit(entry),
                 icon: const Icon(Icons.logout, size: 18),
                 label: const Text('Salida'),
                 style: ElevatedButton.styleFrom(
@@ -666,13 +901,15 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 padding: EdgeInsets.only(bottom: 16.0),
                 child: LinearProgressIndicator(),
               ),
+            Center(child: _buildModeToggle()),
+            const SizedBox(height: 16),
             if (_isFormStage) _buildForm(),
             if (_stage != _RecepcionStage.idle)
               Padding(
                 padding: const EdgeInsets.only(top: 16),
                 child: _buildStatusCard(),
               ),
-            _buildActiveVehicles(),
+            _buildActiveList(),
           ],
         ),
       ),
@@ -680,7 +917,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   }
 }
 
-/// Card de resultado genérica (aprobado/negado/pendiente/error).
 class _ResultCard extends StatelessWidget {
   final IconData icon;
   final Color color;

@@ -1,7 +1,7 @@
 name: guaicaramo_control
 description: "Aplicación de control para la red mesh Meshtastic de Guaicaramo (chat, mapa, recepción de vehículos)."
 publish_to: 'none'
-version: 0.1.1+2
+version: 0.2.0+3
 
 environment:
   sdk: ^3.10.7
