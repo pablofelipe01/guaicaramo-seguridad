@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# MBTiles (mapas offline) — generados con scripts/download_mbtiles.py
+# Demasiado grandes para git, regeneración local de cada quien.
+assets/maps/*.mbtiles
