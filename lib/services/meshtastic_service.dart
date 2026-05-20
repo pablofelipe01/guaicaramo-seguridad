@@ -19,19 +19,11 @@ const String _lastSessionDateKey = 'last_session_date';
 const int _maxMessageHistory = 100;
 const int _maxTrackPoints = 500;
 
-// Nodos pregrabados — heredados de sirius_porteria.
-const int gatewayNodeId = 0x49b54674;
-const String gatewayNodeName = 'Gateway Jetson';
-const int pabloANodeId = 0x7c1a5974;
-const String pabloANodeName = 'Pablo A';
-const int pabloLongNodeId = 0xf515b946;
-const String pabloLongNodeName = 'Pablo Long';
-const int davidIngeNodeId = 0x455250c3;
-const String davidIngeNodeName = 'David_Inge';
-const int testDavidNodeId = 0x4190dee3;
-const String testDavidNodeName = 'Test David';
-const int macCommanderNodeId = 0x4bf18b6e;
-const String macCommanderNodeName = 'Mac Commander';
+// Gateway de Guaicaramo — nodo Heltec V3 conectado por USB a la Pi.
+// Es el único nodo pre-cargado; los demás aparecen automáticamente al
+// recibir tráfico de la mesh (NodeInfo o mensajes de texto).
+const int gatewayNodeId = 0x9ea29bc4;
+const String gatewayNodeName = 'Guaicaramo Gateway';
 
 enum ConnectionStatus {
   disconnected,
@@ -119,11 +111,6 @@ class MeshtasticService extends ChangeNotifier {
 
   static final List<MeshNode> _preloadedNodes = [
     MeshNode(nodeId: gatewayNodeId, nodeName: gatewayNodeName, isOnline: true),
-    MeshNode(nodeId: pabloANodeId, nodeName: pabloANodeName, isOnline: true),
-    MeshNode(nodeId: pabloLongNodeId, nodeName: pabloLongNodeName, isOnline: true),
-    MeshNode(nodeId: davidIngeNodeId, nodeName: davidIngeNodeName, isOnline: true),
-    MeshNode(nodeId: testDavidNodeId, nodeName: testDavidNodeName, isOnline: true),
-    MeshNode(nodeId: macCommanderNodeId, nodeName: macCommanderNodeName, isOnline: true),
   ];
 
   int get currentGatewayNodeId => _selectedGatewayNodeId ?? gatewayNodeId;

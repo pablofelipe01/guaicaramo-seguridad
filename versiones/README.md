@@ -66,5 +66,6 @@ adb install -r versiones/guaicaramo_control_0.1.0_2026-05-20.apk
 | Version | Fecha | APK | Notas |
 |---|---|---|---|
 | 0.1.0 | 2026-05-20 | `guaicaramo_control_0.1.0_2026-05-20.apk` | Primer release: chat, recepción, mapa offline, gateway Airtable. |
+| 0.1.1 | 2026-05-20 | `guaicaramo_control_0.1.1_2026-05-20_fix-gateway-id.apk` | Fix: gateway por defecto cambiado a `!9ea29bc4` (Heltec V3 de Guaicaramo). Limpieza de nodos preloaded de sirius_porteria. |
 
 Agrega filas a esta tabla con cada release.
