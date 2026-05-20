@@ -47,3 +47,12 @@ app.*.map.json
 # MBTiles (mapas offline) — generados con scripts/download_mbtiles.py
 # Demasiado grandes para git, regeneración local de cada quien.
 assets/maps/*.mbtiles
+
+# Android signing — NUNCA commitear
+android/keystore.jks
+android/key.properties
+android/*.jks
+android/*.keystore
+
+# APKs release — pesados, regeneración via scripts/release_apk.sh
+versiones/*.apk
