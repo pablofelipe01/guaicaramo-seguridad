@@ -1,0 +1,56 @@
+name: guaicaramo_control
+description: "Aplicación de control para la red mesh Meshtastic de Guaicaramo (chat, mapa, recepción de vehículos)."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.10.7
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  meshtastic_flutter:
+    path: packages/meshtastic_flutter
+  shared_preferences: ^2.2.2
+  permission_handler: ^12.0.1
+
+  # Mapa offline (Fase 4)
+  flutter_map: ^7.0.0
+  flutter_map_mbtiles: ^1.0.4
+  latlong2: ^0.9.1
+  path_provider: ^2.1.4
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.1
+  flutter_native_splash: ^2.4.3
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/maps/
+    - assets/branding/
+
+# Para regenerar iconos: dart run flutter_launcher_icons
+# Requiere assets/branding/icon.png (ver assets/branding/README.md).
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/branding/icon.png"
+  remove_alpha_ios: true
+  min_sdk_android: 21
+  adaptive_icon_background: "#2E7D32"
+  adaptive_icon_foreground: "assets/branding/icon.png"
+
+# Para regenerar splash: dart run flutter_native_splash:create
+flutter_native_splash:
+  color: "#2E7D32"
+  image: "assets/branding/splash.png"
+  android_12:
+    color: "#2E7D32"
+    image: "assets/branding/splash.png"
