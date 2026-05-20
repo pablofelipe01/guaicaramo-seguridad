@@ -35,7 +35,7 @@ import sys
 import time
 import traceback
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import requests
@@ -223,11 +223,12 @@ def handle_consulta(interface, from_num: int, parts: list[str]) -> None:
             return
 
         # Verificar vencimiento si existe.
+        # Airtable retorna fechas como "YYYY-MM-DD" (sin tz) — comparamos solo la fecha.
         vence = fields.get("vence")
         if vence:
             try:
-                vence_date = datetime.fromisoformat(vence.replace("Z", "+00:00"))
-                if vence_date < datetime.now(timezone.utc):
+                vence_date = date.fromisoformat(vence[:10])
+                if vence_date < date.today():
                     log.info("Placa %s vencida (%s).", placa, vence)
                     send_text(interface, from_num, f"RESPUESTA|{request_id}|NO_APROBADO")
                     return
