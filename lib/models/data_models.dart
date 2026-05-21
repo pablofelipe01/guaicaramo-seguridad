@@ -166,6 +166,30 @@ class NodePositionPoint {
   NodePositionPoint(this.latitude, this.longitude, this.timestamp);
 }
 
+/// Acompañante de un conductor — persona que va en el mismo vehículo.
+/// Se verifica contra la tabla Personas (CC). El nombre se llena desde
+/// el resultado de la consulta si la persona está registrada.
+class Acompanante {
+  final String cedula;
+  final String? nombre;
+
+  const Acompanante({required this.cedula, this.nombre});
+
+  Map<String, dynamic> toJson() => {
+        'cedula': cedula,
+        'nombre': nombre,
+      };
+
+  factory Acompanante.fromJson(Map<String, dynamic> json) => Acompanante(
+        cedula: json['cedula'] as String,
+        nombre: json['nombre'] as String?,
+      );
+
+  /// Render para mostrar / persistir: "CC - Nombre" o solo "CC".
+  String get displayLine =>
+      (nombre != null && nombre!.isNotEmpty) ? '$cedula - $nombre' : cedula;
+}
+
 /// Vehículo que entró por la portería. Reemplaza ActiveVisitor.
 class VehicleEntry {
   final String cedula;
@@ -177,12 +201,16 @@ class VehicleEntry {
   /// supervisor si fue aprobación manual.
   final String approvedBy;
 
+  /// Lista de hasta 4 acompañantes registrados con esta entrada.
+  final List<Acompanante> acompanantes;
+
   VehicleEntry({
     required this.cedula,
     required this.placa,
     required this.entryTime,
     required this.approvedBy,
     this.exitTime,
+    this.acompanantes = const [],
   });
 
   bool get hasExited => exitTime != null;
@@ -206,14 +234,20 @@ class VehicleEntry {
         'entryTime': entryTime.toIso8601String(),
         'exitTime': exitTime?.toIso8601String(),
         'approvedBy': approvedBy,
+        'acompanantes': acompanantes.map((a) => a.toJson()).toList(),
       };
 
   factory VehicleEntry.fromJson(Map<String, dynamic> json) {
+    final acompananteList = (json['acompanantes'] as List<dynamic>?)
+            ?.map((e) => Acompanante.fromJson(e as Map<String, dynamic>))
+            .toList() ??
+        const <Acompanante>[];
     final v = VehicleEntry(
       cedula: json['cedula'] as String,
       placa: json['placa'] as String,
       entryTime: DateTime.parse(json['entryTime'] as String),
       approvedBy: json['approvedBy'] as String? ?? 'GATEWAY',
+      acompanantes: acompananteList,
     );
     if (json['exitTime'] != null) {
       v.exitTime = DateTime.parse(json['exitTime'] as String);
@@ -231,10 +265,16 @@ class VehicleRequest {
   final int fromNodeId;
   final String fromNodeName;
   final DateTime timestamp;
+  /// Contexto opcional que el portero envía con la solicitud para que el
+  /// supervisor entienda de qué se trata ("viene a entregar paquete", etc.).
+  final String? porteroComment;
   bool isResponded;
   String? responseStatus; // APROBADO, NEGADO, PENDIENTE
   String? supervisorName;
   String? comment;
+
+  /// CCs de acompañantes incluidos en la solicitud. Vacío si no hay.
+  final List<String> acompananteCedulas;
 
   VehicleRequest({
     required this.requestId,
@@ -243,6 +283,8 @@ class VehicleRequest {
     required this.fromNodeId,
     required this.fromNodeName,
     required this.timestamp,
+    this.porteroComment,
+    this.acompananteCedulas = const [],
     this.isResponded = false,
     this.responseStatus,
     this.supervisorName,
@@ -268,6 +310,8 @@ class VehicleRequest {
         'fromNodeId': fromNodeId,
         'fromNodeName': fromNodeName,
         'timestamp': timestamp.toIso8601String(),
+        'porteroComment': porteroComment,
+        'acompananteCedulas': acompananteCedulas,
         'isResponded': isResponded,
         'responseStatus': responseStatus,
         'supervisorName': supervisorName,
@@ -281,6 +325,11 @@ class VehicleRequest {
         fromNodeId: json['fromNodeId'] as int,
         fromNodeName: json['fromNodeName'] as String,
         timestamp: DateTime.parse(json['timestamp'] as String),
+        porteroComment: json['porteroComment'] as String?,
+        acompananteCedulas: (json['acompananteCedulas'] as List<dynamic>?)
+                ?.map((e) => e as String)
+                .toList() ??
+            const <String>[],
         isResponded: json['isResponded'] as bool? ?? false,
         responseStatus: json['responseStatus'] as String?,
         supervisorName: json['supervisorName'] as String?,
@@ -394,6 +443,7 @@ class PersonRequest {
   final int fromNodeId;
   final String fromNodeName;
   final DateTime timestamp;
+  final String? porteroComment;
   bool isResponded;
   String? responseStatus;
   String? supervisorName;
@@ -405,6 +455,7 @@ class PersonRequest {
     required this.fromNodeId,
     required this.fromNodeName,
     required this.timestamp,
+    this.porteroComment,
     this.isResponded = false,
     this.responseStatus,
     this.supervisorName,
@@ -429,6 +480,7 @@ class PersonRequest {
         'fromNodeId': fromNodeId,
         'fromNodeName': fromNodeName,
         'timestamp': timestamp.toIso8601String(),
+        'porteroComment': porteroComment,
         'isResponded': isResponded,
         'responseStatus': responseStatus,
         'supervisorName': supervisorName,
@@ -441,6 +493,7 @@ class PersonRequest {
         fromNodeId: json['fromNodeId'] as int,
         fromNodeName: json['fromNodeName'] as String,
         timestamp: DateTime.parse(json['timestamp'] as String),
+        porteroComment: json['porteroComment'] as String?,
         isResponded: json['isResponded'] as bool? ?? false,
         responseStatus: json['responseStatus'] as String?,
         supervisorName: json['supervisorName'] as String?,

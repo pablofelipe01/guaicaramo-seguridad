@@ -854,14 +854,54 @@ class MeshtasticService extends ChangeNotifier {
     return completer.future;
   }
 
+  /// Sanitiza un texto para que no rompa el split por `|` del protocolo.
+  /// Reemplaza pipes con `/` y recorta a 150 caracteres.
+  static String _sanitizeComment(String? raw) {
+    if (raw == null) return '';
+    final cleaned = raw.replaceAll('|', '/').trim();
+    return cleaned.length > 150 ? cleaned.substring(0, 150) : cleaned;
+  }
+
+  /// Empaca hasta 4 acompañantes como 8 partes intercaladas (cc1|nombre1|...).
+  /// Si la lista tiene menos de 4, las posiciones sobrantes quedan vacías.
+  static List<String> _packAcompanantes(List<Acompanante> list) {
+    final out = <String>[];
+    for (var i = 0; i < 4; i++) {
+      if (i < list.length) {
+        out.add(_sanitizeShort(list[i].cedula));
+        out.add(_sanitizeShort(list[i].nombre ?? ''));
+      } else {
+        out.add('');
+        out.add('');
+      }
+    }
+    return out;
+  }
+
+  static String _sanitizeShort(String s) {
+    final cleaned = s.replaceAll('|', '/').trim();
+    return cleaned.length > 40 ? cleaned.substring(0, 40) : cleaned;
+  }
+
+
   /// Solicita aprobación manual a un supervisor enviando
-  /// `SOLICITUD_V|<cedula>|<placa>` como DM al supervisorNodeId.
+  /// `SOLICITUD_V|<cedula>|<placa>|<comment>|<a1>|<a2>|<a3>|<a4>` (CCs solamente).
   Future<bool> requestVehicleApproval({
     required String cedula,
     required String placa,
     required int supervisorNodeId,
+    String? comment,
+    List<String> acompananteCedulas = const [],
   }) async {
-    final message = 'SOLICITUD_V|$cedula|$placa';
+    final safeComment = _sanitizeComment(comment);
+    final ccs = List<String>.generate(4, (i) {
+      if (i < acompananteCedulas.length) {
+        return _sanitizeShort(acompananteCedulas[i]);
+      }
+      return '';
+    });
+    final message =
+        'SOLICITUD_V|$cedula|$placa|$safeComment|${ccs.join('|')}';
     debugPrint(
       '🚗 [VEHICLE] SOLICITUD_V → 0x${supervisorNodeId.toRadixString(16)}: $message',
     );
@@ -879,8 +919,9 @@ class MeshtasticService extends ChangeNotifier {
   }) async {
     if (!isConnected || _client == null) return false;
 
-    final body = comment != null && comment.isNotEmpty
-        ? '$status|$supervisorName|$comment'
+    final safeComment = _sanitizeComment(comment);
+    final body = safeComment.isNotEmpty
+        ? '$status|$supervisorName|$safeComment'
         : '$status|$supervisorName';
 
     debugPrint(
@@ -894,7 +935,7 @@ class MeshtasticService extends ChangeNotifier {
         r.isResponded = true;
         r.responseStatus = status;
         r.supervisorName = supervisorName;
-        r.comment = (comment != null && comment.isNotEmpty) ? comment : null;
+        r.comment = safeComment.isNotEmpty ? safeComment : null;
         break;
       }
     }
@@ -903,18 +944,21 @@ class MeshtasticService extends ChangeNotifier {
     return true;
   }
 
-  /// `ENTRADA_V|<cedula>|<placa>|<aprobadoPor>` al gateway.
+  /// `ENTRADA_V|<cedula>|<placa>|<aprobadoPor>|<a1cc>|<a1nom>|<a2cc>|<a2nom>|<a3cc>|<a3nom>|<a4cc>|<a4nom>`
   Future<bool> sendEntryToGateway({
     required String cedula,
     required String placa,
     required String approvedBy,
+    List<Acompanante> acompanantes = const [],
   }) async {
-    final message = 'ENTRADA_V|$cedula|$placa|$approvedBy';
+    final packed = _packAcompanantes(acompanantes);
+    final message =
+        'ENTRADA_V|$cedula|$placa|$approvedBy|${packed.join('|')}';
     debugPrint('🚗 [VEHICLE] ENTRADA_V → gateway: $message');
     return sendChatMessage(message, destinationId: currentGatewayNodeId);
   }
 
-  /// `REGISTRO_MANUAL|<status>|<cedula>|<placa>|<supervisor>|<comment>` al gateway.
+  /// `REGISTRO_MANUAL|<status>|<cedula>|<placa>|<supervisor>|<comment>|<a1cc>|<a1nom>|...|<a4nom>`
   /// Usado cuando la aprobación vino del supervisor (no de la lista de Airtable).
   Future<bool> sendRegistroManualToGateway({
     required String status,
@@ -922,9 +966,12 @@ class MeshtasticService extends ChangeNotifier {
     required String placa,
     required String supervisor,
     String? comment,
+    List<Acompanante> acompanantes = const [],
   }) async {
+    final safeComment = _sanitizeComment(comment);
+    final packed = _packAcompanantes(acompanantes);
     final message =
-        'REGISTRO_MANUAL|$status|$cedula|$placa|$supervisor|${comment ?? ''}';
+        'REGISTRO_MANUAL|$status|$cedula|$placa|$supervisor|$safeComment|${packed.join('|')}';
     debugPrint('🚗 [VEHICLE] REGISTRO_MANUAL → gateway: $message');
     return sendChatMessage(message, destinationId: currentGatewayNodeId);
   }
@@ -972,12 +1019,15 @@ class MeshtasticService extends ChangeNotifier {
     return completer.future;
   }
 
-  /// `SOLICITUD_P|<cedula>` como DM al supervisor.
+  /// `SOLICITUD_P|<cedula>|<comment>` como DM al supervisor.
+  /// El comment es opcional pero útil para que el supervisor entienda el contexto.
   Future<bool> requestPersonApproval({
     required String cedula,
     required int supervisorNodeId,
+    String? comment,
   }) async {
-    final message = 'SOLICITUD_P|$cedula';
+    final safeComment = _sanitizeComment(comment);
+    final message = 'SOLICITUD_P|$cedula|$safeComment';
     debugPrint(
       '🚶 [PERSON] SOLICITUD_P → 0x${supervisorNodeId.toRadixString(16)}: $message',
     );
@@ -993,9 +1043,10 @@ class MeshtasticService extends ChangeNotifier {
   }) async {
     if (!isConnected || _client == null) return false;
 
+    final safeComment = _sanitizeComment(comment);
     // Sufijo _P para distinguir de respuestas de vehículos.
-    final body = comment != null && comment.isNotEmpty
-        ? '${status}_P|$supervisorName|$comment'
+    final body = safeComment.isNotEmpty
+        ? '${status}_P|$supervisorName|$safeComment'
         : '${status}_P|$supervisorName';
 
     debugPrint(
@@ -1009,7 +1060,7 @@ class MeshtasticService extends ChangeNotifier {
         r.isResponded = true;
         r.responseStatus = status;
         r.supervisorName = supervisorName;
-        r.comment = (comment != null && comment.isNotEmpty) ? comment : null;
+        r.comment = safeComment.isNotEmpty ? safeComment : null;
         break;
       }
     }
@@ -1081,14 +1132,19 @@ class MeshtasticService extends ChangeNotifier {
     required String cedula,
     required String placa,
     required String approvedBy,
+    List<Acompanante> acompanantes = const [],
   }) {
     _vehicleEntries.add(VehicleEntry(
       cedula: cedula,
       placa: placa,
       entryTime: DateTime.now(),
       approvedBy: approvedBy,
+      acompanantes: acompanantes,
     ));
-    debugPrint('🚗 [VEHICLE] Entrada registrada: $placa ($cedula)');
+    debugPrint(
+      '🚗 [VEHICLE] Entrada registrada: $placa ($cedula)'
+      '${acompanantes.isNotEmpty ? " +${acompanantes.length} acompañantes" : ""}',
+    );
     _saveVehicleEntries();
     notifyListeners();
   }
@@ -1254,17 +1310,26 @@ class MeshtasticService extends ChangeNotifier {
       }
 
       // SOLICITUD_P — supervisor recibe pedido para peatón.
+      // Formato nuevo: SOLICITUD_P|cedula|comment  (3 partes)
+      // Formato viejo: SOLICITUD_P|cedula          (2 partes — sin comment)
       if (text.startsWith('SOLICITUD_P|')) {
         final parts = text.split('|');
         if (parts.length >= 2) {
+          final porteroComment = parts.length >= 3 && parts[2].isNotEmpty
+              ? parts[2]
+              : null;
           final request = PersonRequest(
             requestId: DateTime.now().millisecondsSinceEpoch,
             cedula: parts[1],
             fromNodeId: fromNodeId,
             fromNodeName: fromName,
             timestamp: DateTime.now(),
+            porteroComment: porteroComment,
           );
-          debugPrint('🚶 [PERSON] SOLICITUD_P CC ${parts[1]} de $fromName');
+          debugPrint(
+            '🚶 [PERSON] SOLICITUD_P CC ${parts[1]} de $fromName'
+            '${porteroComment != null ? " — \"$porteroComment\"" : ""}',
+          );
           _personRequests.add(request);
           _personRequestController.add(request);
           _savePersonRequests();
@@ -1338,9 +1403,21 @@ class MeshtasticService extends ChangeNotifier {
       }
 
       // SOLICITUD_V — supervisor recibe pedido de aprobación manual.
+      // Formato actual: SOLICITUD_V|cedula|placa|comment|a1cc|a2cc|a3cc|a4cc  (8 partes)
+      // Formato anterior: SOLICITUD_V|cedula|placa|comment                   (4 partes)
+      // Formato original: SOLICITUD_V|cedula|placa                           (3 partes)
+      // El parser tolera todos para no romper celulares en versiones viejas.
       if (text.startsWith('SOLICITUD_V|')) {
         final parts = text.split('|');
         if (parts.length >= 3) {
+          final porteroComment = parts.length >= 4 && parts[3].isNotEmpty
+              ? parts[3]
+              : null;
+          final acompCedulas = <String>[];
+          for (var i = 4; i < parts.length && i < 8; i++) {
+            final cc = parts[i].trim();
+            if (cc.isNotEmpty) acompCedulas.add(cc);
+          }
           final request = VehicleRequest(
             requestId: DateTime.now().millisecondsSinceEpoch,
             cedula: parts[1],
@@ -1348,9 +1425,13 @@ class MeshtasticService extends ChangeNotifier {
             fromNodeId: fromNodeId,
             fromNodeName: fromName,
             timestamp: DateTime.now(),
+            porteroComment: porteroComment,
+            acompananteCedulas: acompCedulas,
           );
           debugPrint(
-            '🚗 [VEHICLE] SOLICITUD_V recibida: ${parts[2]} (CC ${parts[1]}) de $fromName',
+            '🚗 [VEHICLE] SOLICITUD_V recibida: ${parts[2]} (CC ${parts[1]}) de $fromName'
+            '${porteroComment != null ? " — \"$porteroComment\"" : ""}'
+            '${acompCedulas.isNotEmpty ? " +${acompCedulas.length} acomp" : ""}',
           );
           _vehicleRequests.add(request);
           _vehicleRequestController.add(request);

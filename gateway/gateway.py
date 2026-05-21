@@ -101,6 +101,27 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _format_acompanantes(parts_slice: list[str]) -> str:
+    """Toma una lista de 8 elementos (cc1, nom1, cc2, nom2, ...) y devuelve
+    un texto multilínea para guardar en Airtable.
+
+    Ignora pares con CC vacía. Formato por línea:
+      - "CC - Nombre"  si hay nombre
+      - "CC"           si solo hay CC
+    """
+    lines = []
+    for i in range(0, min(len(parts_slice), 8), 2):
+        cc = parts_slice[i].strip() if i < len(parts_slice) else ""
+        if not cc:
+            continue
+        nombre = parts_slice[i + 1].strip() if i + 1 < len(parts_slice) else ""
+        if nombre:
+            lines.append(f"{cc} - {nombre}")
+        else:
+            lines.append(cc)
+    return "\n".join(lines)
+
+
 def _is_expired(vence: str) -> bool:
     """Devuelve True si el valor de Airtable `vence` ya pasó.
 
@@ -327,26 +348,38 @@ def handle_consulta(interface, from_num: int, parts: list[str]) -> None:
 
 
 def handle_entrada(interface, from_num: int, parts: list[str]) -> None:
-    """ENTRADA_V|<cedula>|<placa>|<aprobadoPor>."""
+    """ENTRADA_V|<cedula>|<placa>|<aprobadoPor>[|<a1cc>|<a1nom>|<a2cc>|<a2nom>|<a3cc>|<a3nom>|<a4cc>|<a4nom>]
+
+    Las 8 partes finales (acompañantes) son opcionales — formatos viejos
+    sin acompañantes (4 partes) siguen funcionando.
+    """
     if len(parts) < 4:
         log.warning("ENTRADA_V formato inválido: %s", parts)
         return
     _, cedula, placa, approved_by = parts[0], parts[1], parts[2].upper(), parts[3]
-    log.info("🚗 ENTRADA_V placa=%s aprobadoPor=%s", placa, approved_by)
+    acompanantes_text = _format_acompanantes(parts[4:12])
+    log.info(
+        "🚗 ENTRADA_V placa=%s aprobadoPor=%s%s",
+        placa,
+        approved_by,
+        f" +acomp({acompanantes_text.count(chr(10)) + 1 if acompanantes_text else 0})"
+        if acompanantes_text else "",
+    )
 
     try:
-        record_id = airtable_create_registro(
-            {
-                "tipo": "ENTRADA",
-                "categoria": "VEHICULO",
-                "cedula": cedula,
-                "placa": placa,
-                "entry_time": _now_iso(),
-                "approved_by": approved_by,
-                "status": "APROBADO",
-                "nodo_origen": _node_hex(from_num),
-            }
-        )
+        fields = {
+            "tipo": "ENTRADA",
+            "categoria": "VEHICULO",
+            "cedula": cedula,
+            "placa": placa,
+            "entry_time": _now_iso(),
+            "approved_by": approved_by,
+            "status": "APROBADO",
+            "nodo_origen": _node_hex(from_num),
+        }
+        if acompanantes_text:
+            fields["acompanantes"] = acompanantes_text
+        record_id = airtable_create_registro(fields)
         log.info("✓ Entrada creada (record %s)", record_id)
     except AirtableError as e:
         log.error("AirtableError en ENTRADA_V: %s", e)
@@ -386,7 +419,10 @@ def handle_salida(interface, from_num: int, parts: list[str]) -> None:
 
 
 def handle_registro_manual(interface, from_num: int, parts: list[str]) -> None:
-    """REGISTRO_MANUAL|<status>|<cedula>|<placa>|<supervisor>|<comment>."""
+    """REGISTRO_MANUAL|<status>|<cedula>|<placa>|<supervisor>|<comment>[|<a1cc>|<a1nom>|...|<a4nom>]
+
+    Las 8 partes finales (acompañantes) son opcionales.
+    """
     if len(parts) < 6:
         log.warning("REGISTRO_MANUAL formato inválido: %s", parts)
         return
@@ -395,6 +431,7 @@ def handle_registro_manual(interface, from_num: int, parts: list[str]) -> None:
     placa = parts[3].upper()
     supervisor = parts[4]
     comment = parts[5] if len(parts) > 5 else ""
+    acompanantes_text = _format_acompanantes(parts[6:14])
 
     log.info(
         "🚗 REGISTRO_MANUAL placa=%s status=%s supervisor=%s",
@@ -413,6 +450,8 @@ def handle_registro_manual(interface, from_num: int, parts: list[str]) -> None:
             "comment": comment,
             "nodo_origen": _node_hex(from_num),
         }
+        if acompanantes_text:
+            fields["acompanantes"] = acompanantes_text
         if status == "APROBADO":
             fields["entry_time"] = _now_iso()
         else:

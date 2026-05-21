@@ -187,6 +187,85 @@ class _RequestsScreenState extends State<RequestsScreen> {
                 ),
               ],
             ),
+            if (item.porteroComment != null &&
+                item.porteroComment!.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.amber.shade50,
+                  border: Border.all(color: Colors.amber.shade200),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.info_outline,
+                        size: 18, color: Colors.amber.shade800),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        item.porteroComment!,
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: Colors.amber.shade900,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            if (item.acompananteCedulas.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.blueGrey.shade50,
+                  border: Border.all(color: Colors.blueGrey.shade200),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.group,
+                            size: 18, color: Colors.blueGrey.shade700),
+                        const SizedBox(width: 8),
+                        Text(
+                          'Acompañantes (${item.acompananteCedulas.length}):',
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.blueGrey.shade800,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    for (final cc in item.acompananteCedulas)
+                      Padding(
+                        padding: const EdgeInsets.only(left: 26, top: 2),
+                        child: Text(
+                          'CC $cc',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.blueGrey.shade700,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
             if (isResponded) ...[
               const SizedBox(height: 8),
               _buildRespondedBadge(item),
@@ -419,6 +498,10 @@ class _Item {
   String? get supervisorName =>
       isVehicle ? vehicle!.supervisorName : person!.supervisorName;
   String? get comment => isVehicle ? vehicle!.comment : person!.comment;
+  String? get porteroComment =>
+      isVehicle ? vehicle!.porteroComment : person!.porteroComment;
+  List<String> get acompananteCedulas =>
+      isVehicle ? vehicle!.acompananteCedulas : const <String>[];
   String get formattedTime =>
       isVehicle ? vehicle!.formattedTime : person!.formattedTime;
   String get formattedDate =>
