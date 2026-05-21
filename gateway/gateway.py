@@ -101,6 +101,38 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _is_expired(vence: str) -> bool:
+    """Devuelve True si el valor de Airtable `vence` ya pasó.
+
+    Soporta dos formatos:
+      - dateTime ISO 8601 con tz, ej "2026-05-21T18:00:00.000Z" o "...+00:00".
+        → comparación al segundo contra now(UTC).
+      - date "YYYY-MM-DD" (campo viejo tipo date).
+        → vigente hasta el FIN del día local (Bogotá). Lo convertimos a fin
+          de día UTC para que coincida con cómo Airtable mostraría 23:59 local.
+
+    Si el valor es inválido, retorna False (no rechazar por dato corrupto).
+    """
+    try:
+        # dateTime con tz
+        if "T" in vence:
+            iso = vence.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                # Si por algún motivo viene sin tz, asumir UTC.
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt < datetime.now(timezone.utc)
+        # Solo date — vigente todo el día (UTC end-of-day para evitar romper
+        # registros viejos durante la transición).
+        d = date.fromisoformat(vence[:10])
+        end_of_day_utc = datetime(d.year, d.month, d.day, 23, 59, 59,
+                                  tzinfo=timezone.utc)
+        return end_of_day_utc < datetime.now(timezone.utc)
+    except (ValueError, TypeError):
+        log.warning("Fecha de vencimiento inválida: %r", vence)
+        return False
+
+
 def airtable_find_placa(placa: str) -> dict[str, Any] | None:
     """Busca una placa exacta (case-insensitive) en la tabla Placas."""
     placa_upper = placa.upper().strip()
@@ -271,17 +303,13 @@ def handle_consulta(interface, from_num: int, parts: list[str]) -> None:
             return
 
         # Verificar vencimiento si existe.
-        # Airtable retorna fechas como "YYYY-MM-DD" (sin tz) — comparamos solo la fecha.
+        # Airtable retorna dateTime en ISO 8601 con tz (UTC):
+        #   "2026-05-21T18:00:00.000Z" o "2026-05-21" si el campo es solo date.
         vence = fields.get("vence")
-        if vence:
-            try:
-                vence_date = date.fromisoformat(vence[:10])
-                if vence_date < date.today():
-                    log.info("Placa %s vencida (%s).", placa, vence)
-                    send_text(interface, from_num, f"RESPUESTA|{request_id}|NO_APROBADO")
-                    return
-            except ValueError:
-                log.warning("Fecha de vencimiento inválida: %r", vence)
+        if vence and _is_expired(vence):
+            log.info("Placa %s vencida (%s).", placa, vence)
+            send_text(interface, from_num, f"RESPUESTA|{request_id}|NO_APROBADO")
+            return
 
         conductor = (fields.get("conductor") or "").strip()
         send_text(
@@ -423,16 +451,11 @@ def handle_consulta_persona(interface, from_num: int, parts: list[str]) -> None:
             return
 
         vence = fields.get("vence")
-        if vence:
-            try:
-                vence_date = date.fromisoformat(vence[:10])
-                if vence_date < date.today():
-                    log.info("Persona %s vencida (%s).", cedula, vence)
-                    send_text(interface, from_num,
-                              f"RESPUESTA_P|{request_id}|NO_APROBADO")
-                    return
-            except ValueError:
-                log.warning("Fecha de vencimiento inválida: %r", vence)
+        if vence and _is_expired(vence):
+            log.info("Persona %s vencida (%s).", cedula, vence)
+            send_text(interface, from_num,
+                      f"RESPUESTA_P|{request_id}|NO_APROBADO")
+            return
 
         nombre = (fields.get("nombre") or "").strip()
         send_text(interface, from_num,
