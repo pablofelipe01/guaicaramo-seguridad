@@ -285,9 +285,14 @@ def airtable_find_active_person(cedula: str) -> dict[str, Any] | None:
 
 
 def send_text(interface, destination_node: int, text: str) -> None:
-    """Envía un texto como DM a un nodo. Maneja excepciones del SDK."""
+    """Envía un texto como DM a un nodo.
+
+    wantAck=True hace que el stack Meshtastic reintente hasta 3 veces si el
+    destino no acusa recibo dentro del timeout. Sin esto, una pérdida puntual
+    de paquete deja al portero esperando para siempre (hasta su timeout de 30s).
+    """
     try:
-        interface.sendText(text, destinationId=destination_node, wantAck=False)
+        interface.sendText(text, destinationId=destination_node, wantAck=True)
         log.info("📤 → %s: %s", _node_hex(destination_node), text)
     except Exception as e:
         log.error("✗ Error enviando a %s: %s", _node_hex(destination_node), e)
