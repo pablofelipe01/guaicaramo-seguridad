@@ -56,6 +56,7 @@ AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "").strip()
 AIRTABLE_PLACAS_TABLE = os.getenv("AIRTABLE_PLACAS_TABLE", "Placas").strip()
 AIRTABLE_REGISTROS_TABLE = os.getenv("AIRTABLE_REGISTROS_TABLE", "Registros").strip()
 AIRTABLE_PERSONAS_TABLE = os.getenv("AIRTABLE_PERSONAS_TABLE", "Personas").strip()
+AIRTABLE_ITEMS_TABLE = os.getenv("AIRTABLE_ITEMS_TABLE", "Items").strip()
 
 # Conexión al nodo Meshtastic. Una de las tres debe estar definida.
 MESHTASTIC_SERIAL = os.getenv("MESHTASTIC_SERIAL", "").strip()  # ej: /dev/ttyUSB0
@@ -610,6 +611,137 @@ def handle_registro_manual_persona(interface, from_num: int, parts: list[str]) -
         log.error("Excepción en REGISTRO_MANUAL_P:\n%s", traceback.format_exc())
 
 
+# ---------- Handlers de items (órdenes de salida) ----------
+
+
+def _airtable_items_url() -> str:
+    return _airtable_url(AIRTABLE_ITEMS_TABLE)
+
+
+def airtable_list_authorized_items() -> list[dict[str, Any]]:
+    """Devuelve items con autorizado=true y usado=false."""
+    formula = "AND({autorizado} = TRUE(), {usado} != TRUE())"
+    params = {"filterByFormula": formula, "pageSize": 100}
+    resp = requests.get(
+        _airtable_items_url(),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"GET Items HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    return resp.json().get("records", [])
+
+
+def airtable_find_item(numero: str) -> dict[str, Any] | None:
+    formula = f"{{numero}} = '{numero.strip()}'"
+    params = {"filterByFormula": formula, "maxRecords": 1}
+    resp = requests.get(
+        _airtable_items_url(),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"GET Items HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    records = resp.json().get("records", [])
+    return records[0] if records else None
+
+
+def airtable_mark_item_used(record_id: str, from_num: int) -> None:
+    url = f"{_airtable_items_url()}/{record_id}"
+    body = {
+        "fields": {
+            "usado": True,
+            "fecha_salida": _now_iso(),
+            "nodo_origen": _node_hex(from_num),
+        }
+    }
+    resp = requests.patch(
+        url,
+        headers=_airtable_headers(),
+        json=body,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"PATCH Items HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+
+
+def _truncate(s: str, n: int) -> str:
+    """Recorta y reemplaza pipes para no romper el split."""
+    s = (s or "").replace("|", "/").replace("\n", " ").strip()
+    return s if len(s) <= n else s[:n]
+
+
+def handle_listar_items(interface, from_num: int, parts: list[str]) -> None:
+    """LISTAR_ITEMS|<requestId>. Responde N veces con LIST_RESP."""
+    if len(parts) < 2:
+        log.warning("LISTAR_ITEMS formato inválido: %s", parts)
+        return
+    request_id = parts[1]
+    log.info("📦 LISTAR_ITEMS req=%s de %s", request_id, _node_hex(from_num))
+
+    try:
+        records = airtable_list_authorized_items()
+    except AirtableError as e:
+        log.error("AirtableError en LISTAR_ITEMS: %s", e)
+        # Respondemos lista vacía para que la app no se quede colgada.
+        send_text(interface, from_num, f"LIST_RESP|{request_id}|0|0")
+        return
+    except Exception:
+        log.error("Excepción en LISTAR_ITEMS:\n%s", traceback.format_exc())
+        send_text(interface, from_num, f"LIST_RESP|{request_id}|0|0")
+        return
+
+    total = len(records)
+    if total == 0:
+        send_text(interface, from_num, f"LIST_RESP|{request_id}|0|0")
+        return
+
+    for i, record in enumerate(records, start=1):
+        f = record.get("fields", {})
+        numero = _truncate(f.get("numero", ""), 16)
+        nombre = _truncate(f.get("nombre", ""), 30)
+        concepto = _truncate(f.get("concepto", ""), 70)
+        destino = _truncate(f.get("destino", ""), 25)
+        autorizado_por = _truncate(f.get("autorizado_por", ""), 25)
+        area = _truncate(f.get("area", ""), 20)
+        msg = (
+            f"LIST_RESP|{request_id}|{i}|{total}|"
+            f"{numero}|{nombre}|{concepto}|{destino}|"
+            f"{autorizado_por}|{area}"
+        )
+        send_text(interface, from_num, msg)
+
+
+def handle_salida_item(interface, from_num: int, parts: list[str]) -> None:
+    """SALIDA_ITEM|<numero>. Marca el item como usado en Airtable."""
+    if len(parts) < 2:
+        log.warning("SALIDA_ITEM formato inválido: %s", parts)
+        return
+    numero = parts[1].strip()
+    log.info("📦 SALIDA_ITEM numero=%s de %s", numero, _node_hex(from_num))
+
+    try:
+        record = airtable_find_item(numero)
+        if record is None:
+            log.warning("Item %s no existe en Airtable.", numero)
+            return
+        airtable_mark_item_used(record["id"], from_num)
+        send_text(interface, from_num, f"SALIDA_ITEM_OK|{numero}")
+        log.info("✓ Item %s marcado como usado (%s)", numero, record["id"])
+    except AirtableError as e:
+        log.error("AirtableError en SALIDA_ITEM: %s", e)
+    except Exception:
+        log.error("Excepción en SALIDA_ITEM:\n%s", traceback.format_exc())
+
+
 # Mapa prefijo → handler. on_receive hace exact match con dict.get(prefix),
 # no startswith, así que el orden no importa y no hay colisión entre
 # CONSULTA y CONSULTA_P (son keys distintas).
@@ -622,6 +754,8 @@ HANDLERS = {
     "ENTRADA_V": handle_entrada,
     "SALIDA_V": handle_salida,
     "REGISTRO_MANUAL": handle_registro_manual,
+    "LISTAR_ITEMS": handle_listar_items,
+    "SALIDA_ITEM": handle_salida_item,
 }
 
 

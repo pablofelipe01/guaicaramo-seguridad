@@ -541,6 +541,82 @@ class PersonResponse {
   bool get isPending => status == 'PENDIENTE';
 }
 
+// ============================================================================
+// Items — órdenes de servicio para sacar cosas de Guaicaramo.
+// Un admin crea la fila en Airtable; el portero la ve en la pestaña Salidas
+// y registra cuándo el item efectivamente sale.
+// ============================================================================
+
+/// Item autorizado para salir de Guaicaramo (orden de servicio).
+class Item {
+  final String numero;
+  final String nombre;
+  final String? concepto;
+  final String? destino;
+  final String? autorizadoPor;
+  final String? area;
+  bool usado;
+
+  /// Si conocemos cuándo se autorizó. No siempre llega en el mensaje resumen.
+  DateTime? fechaAutorizacion;
+
+  /// Cuándo el portero registró la salida. Local.
+  DateTime? fechaSalida;
+
+  Item({
+    required this.numero,
+    required this.nombre,
+    this.concepto,
+    this.destino,
+    this.autorizadoPor,
+    this.area,
+    this.usado = false,
+    this.fechaAutorizacion,
+    this.fechaSalida,
+  });
+
+  bool get hasExited => fechaSalida != null;
+
+  String get title =>
+      '#$numero — $nombre'.replaceAll('— —', '—').trim().replaceAll(RegExp(r'—\s*$'), '');
+
+  Map<String, dynamic> toJson() => {
+        'numero': numero,
+        'nombre': nombre,
+        'concepto': concepto,
+        'destino': destino,
+        'autorizadoPor': autorizadoPor,
+        'area': area,
+        'usado': usado,
+        'fechaAutorizacion': fechaAutorizacion?.toIso8601String(),
+        'fechaSalida': fechaSalida?.toIso8601String(),
+      };
+
+  factory Item.fromJson(Map<String, dynamic> json) => Item(
+        numero: json['numero'] as String,
+        nombre: json['nombre'] as String? ?? '',
+        concepto: json['concepto'] as String?,
+        destino: json['destino'] as String?,
+        autorizadoPor: json['autorizadoPor'] as String?,
+        area: json['area'] as String?,
+        usado: json['usado'] as bool? ?? false,
+        fechaAutorizacion: json['fechaAutorizacion'] != null
+            ? DateTime.parse(json['fechaAutorizacion'] as String)
+            : null,
+        fechaSalida: json['fechaSalida'] != null
+            ? DateTime.parse(json['fechaSalida'] as String)
+            : null,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Item && other.numero == numero;
+
+  @override
+  int get hashCode => numero.hashCode;
+}
+
 class ChatDestination {
   final String displayName;
   final int? channel;

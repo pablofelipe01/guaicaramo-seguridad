@@ -9,6 +9,7 @@ import 'screens/chat_screen.dart';
 import 'screens/map_screen.dart';
 import 'screens/recepcion_screen.dart';
 import 'screens/requests_screen.dart';
+import 'screens/salidas_screen.dart';
 import 'screens/settings_screen.dart';
 
 void main() {
@@ -436,6 +437,8 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
           onOpenChat: openChatWith,
         );
       case 4:
+        return SalidasScreen(meshtasticService: _service);
+      case 5:
         return SettingsScreen(
           meshtasticService: _service,
           onDeviceChange: _navigateToDeviceSelection,
@@ -556,6 +559,11 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               icon: Icon(Icons.map_outlined),
               selectedIcon: Icon(Icons.map),
               label: 'Mapa',
+            ),
+            const NavigationDestination(
+              icon: Icon(Icons.outbox_outlined),
+              selectedIcon: Icon(Icons.outbox),
+              label: 'Salidas',
             ),
             const NavigationDestination(
               icon: Icon(Icons.settings_outlined),

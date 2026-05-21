@@ -16,6 +16,7 @@ const String _vehicleEntriesKey = 'vehicle_entries';
 const String _vehicleRequestsKey = 'vehicle_requests';
 const String _personEntriesKey = 'person_entries';
 const String _personRequestsKey = 'person_requests';
+const String _itemsCacheKey = 'items_cache';
 const String _messageHistoryKey = 'message_history';
 const String _lastSessionDateKey = 'last_session_date';
 const int _maxMessageHistory = 100;
@@ -150,6 +151,36 @@ class MeshtasticService extends ChangeNotifier {
     _requestSeq = (_requestSeq + 1) & 0xFFFF;
     return '${DateTime.now().millisecondsSinceEpoch}-$_requestSeq';
   }
+
+  // ---------- Items (órdenes de salida) ----------
+
+  /// Items conocidos, indexed por numero. Persiste localmente para no perder
+  /// la lista si la app se cierra antes de registrar la salida.
+  final Map<String, Item> _knownItems = {};
+
+  /// Fragmentos de listado en curso: requestId -> {totalEsperado, items}.
+  /// Cuando llegan todos los LIST_RESP de un mismo requestId, se commitea.
+  final Map<String, _ItemListInProgress> _pendingItemLists = {};
+
+  /// requestId de la última solicitud de lista — para que la UI muestre
+  /// progreso o complete cuando llega el total esperado.
+  String? _lastItemListRequestId;
+  int _lastItemListProgress = 0;
+  int _lastItemListTotal = -1;
+
+  final _itemsUpdatedController = StreamController<void>.broadcast();
+
+  Stream<void> get itemsUpdatedStream => _itemsUpdatedController.stream;
+
+  List<Item> get knownItems => _knownItems.values.toList();
+  List<Item> get pendingItems =>
+      _knownItems.values.where((i) => !i.usado).toList();
+
+  int get itemsListProgress => _lastItemListProgress;
+  int get itemsListTotal => _lastItemListTotal;
+  bool get itemsListInProgress =>
+      _lastItemListTotal >= 0 &&
+      _lastItemListProgress < _lastItemListTotal;
 
   final _messageController = StreamController<ChatMessage>.broadcast();
   final _vehicleRequestController = StreamController<VehicleRequest>.broadcast();
@@ -403,6 +434,16 @@ class MeshtasticService extends ChangeNotifier {
         for (final item in decoded) {
           _messageHistory
               .add(ChatMessage.fromJson(item as Map<String, dynamic>));
+        }
+      }
+
+      final itemsJson = prefs.getString(_itemsCacheKey);
+      if (itemsJson != null) {
+        final decoded = jsonDecode(itemsJson) as List<dynamic>;
+        _knownItems.clear();
+        for (final raw in decoded) {
+          final it = Item.fromJson(raw as Map<String, dynamic>);
+          _knownItems[it.numero] = it;
         }
       }
 
@@ -1375,6 +1416,20 @@ class MeshtasticService extends ChangeNotifier {
         return;
       }
 
+      // Items — respuestas del gateway.
+      // LIST_RESP|reqId|seq|total|numero|nombre|concepto|destino|autorizado_por|area
+      if (text.startsWith('LIST_RESP|')) {
+        _handleListResp(text.split('|'));
+        _markPacketProcessed(packetId);
+        return;
+      }
+      // SALIDA_ITEM_OK|numero
+      if (text.startsWith('SALIDA_ITEM_OK|')) {
+        _handleSalidaItemOk(text.split('|'));
+        _markPacketProcessed(packetId);
+        return;
+      }
+
       // RESPUESTA del gateway a una consulta de placa.
       if (text.startsWith('RESPUESTA|')) {
         final parts = text.split('|');
@@ -1651,6 +1706,150 @@ class MeshtasticService extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ---------- Items: API pública ----------
+
+  /// Pide al gateway la lista de items autorizados y no usados.
+  /// El gateway responde con N mensajes LIST_RESP (uno por item).
+  /// La UI escucha [itemsUpdatedStream] para repintar cada vez que llega
+  /// uno nuevo.
+  Future<bool> requestItemsList() async {
+    if (!isConnected || _client == null) return false;
+    final requestId = _newRequestId();
+    _lastItemListRequestId = requestId;
+    _lastItemListProgress = 0;
+    _lastItemListTotal = -1;
+    _pendingItemLists[requestId] = _ItemListInProgress();
+    debugPrint('📦 [ITEM] LISTAR_ITEMS req=$requestId');
+    final ok = await sendChatMessage(
+      'LISTAR_ITEMS|$requestId',
+      destinationId: currentGatewayNodeId,
+    );
+    if (!ok) {
+      _pendingItemLists.remove(requestId);
+    }
+    notifyListeners();
+    return ok;
+  }
+
+  /// Marca el item como salido. Envía SALIDA_ITEM al gateway.
+  /// Actualiza local optimisticamente.
+  Future<bool> registerItemExit(String numero) async {
+    if (!isConnected || _client == null) return false;
+    final item = _knownItems[numero];
+    if (item != null) {
+      item.usado = true;
+      item.fechaSalida = DateTime.now();
+      _saveItemsCache();
+      notifyListeners();
+      _itemsUpdatedController.add(null);
+    }
+    debugPrint('📦 [ITEM] SALIDA_ITEM numero=$numero');
+    return sendChatMessage(
+      'SALIDA_ITEM|$numero',
+      destinationId: currentGatewayNodeId,
+    );
+  }
+
+  // ---------- Items: parsers internos ----------
+
+  /// Procesa un mensaje LIST_RESP recibido del gateway.
+  /// Formato: LIST_RESP|reqId|seq|total|numero|nombre|concepto|destino|autorizado_por|area
+  /// Si total=0, lista vacía (no items).
+  void _handleListResp(List<String> parts) {
+    if (parts.length < 4) return;
+    final reqId = parts[1];
+    final seq = int.tryParse(parts[2]) ?? 0;
+    final total = int.tryParse(parts[3]) ?? 0;
+
+    final progress = _pendingItemLists.putIfAbsent(
+      reqId,
+      _ItemListInProgress.new,
+    );
+
+    if (total == 0) {
+      // Lista vacía: limpiar items pendientes (los que no fueron actualizados).
+      debugPrint('📦 [ITEM] LIST_RESP req=$reqId total=0 (sin items)');
+      _commitItemList(reqId, []);
+      return;
+    }
+
+    if (parts.length < 5) return;
+    final numero = parts[4];
+    final nombre = parts.length > 5 ? parts[5] : '';
+    final concepto = parts.length > 6 ? parts[6] : '';
+    final destino = parts.length > 7 ? parts[7] : '';
+    final autorizadoPor = parts.length > 8 ? parts[8] : '';
+    final area = parts.length > 9 ? parts[9] : '';
+
+    progress.total = total;
+    progress.items[numero] = Item(
+      numero: numero,
+      nombre: nombre,
+      concepto: concepto.isEmpty ? null : concepto,
+      destino: destino.isEmpty ? null : destino,
+      autorizadoPor: autorizadoPor.isEmpty ? null : autorizadoPor,
+      area: area.isEmpty ? null : area,
+      usado: false,
+    );
+    debugPrint(
+      '📦 [ITEM] LIST_RESP req=$reqId seq=$seq/$total → $numero',
+    );
+
+    if (reqId == _lastItemListRequestId) {
+      _lastItemListTotal = total;
+      _lastItemListProgress = progress.items.length;
+    }
+
+    if (progress.items.length >= total) {
+      _commitItemList(reqId, progress.items.values.toList());
+    }
+    _itemsUpdatedController.add(null);
+    notifyListeners();
+  }
+
+  void _commitItemList(String reqId, List<Item> items) {
+    _pendingItemLists.remove(reqId);
+    // Reemplazo total: si el gateway no devuelve un item que antes teníamos,
+    // asumimos que ya fue marcado usado o eliminado.
+    _knownItems.clear();
+    for (final item in items) {
+      _knownItems[item.numero] = item;
+    }
+    if (reqId == _lastItemListRequestId) {
+      _lastItemListProgress = items.length;
+      _lastItemListTotal = items.length;
+    }
+    _saveItemsCache();
+    debugPrint('📦 [ITEM] Lista completa: ${items.length} items');
+    _itemsUpdatedController.add(null);
+    notifyListeners();
+  }
+
+  void _handleSalidaItemOk(List<String> parts) {
+    if (parts.length < 2) return;
+    final numero = parts[1];
+    final item = _knownItems[numero];
+    if (item != null) {
+      item.usado = true;
+      item.fechaSalida ??= DateTime.now();
+      _saveItemsCache();
+      _itemsUpdatedController.add(null);
+      notifyListeners();
+    }
+    debugPrint('📦 [ITEM] SALIDA_ITEM_OK $numero');
+  }
+
+  Future<void> _saveItemsCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final encoded =
+          jsonEncode(_knownItems.values.map((i) => i.toJson()).toList());
+      await prefs.setString(_itemsCacheKey, encoded);
+    } catch (e) {
+      debugPrint('❌ [PERSIST] Error guardando items: $e');
+    }
+  }
+
   @override
   void dispose() {
     _stopKeepalive();
@@ -1662,7 +1861,14 @@ class MeshtasticService extends ChangeNotifier {
     _personRequestController.close();
     _personResponseController.close();
     _nodePositionController.close();
+    _itemsUpdatedController.close();
     _client?.disconnect();
     super.dispose();
   }
+}
+
+/// Helper interno: acumula los LIST_RESP de un requestId hasta tener todos.
+class _ItemListInProgress {
+  int total = -1;
+  final Map<String, Item> items = {};
 }
