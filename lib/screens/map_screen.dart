@@ -12,14 +12,20 @@ import '../services/meshtastic_service.dart';
 import '../widgets/battery_indicator.dart';
 import '../widgets/node_marker.dart';
 
-/// Centro aproximado de la plantación Guaicaramo (Llanos Orientales).
-const _guaicaramoCenter = LatLng(4.36, -72.83);
-const _initialZoom = 14.0;
-const _minZoom = 10.0;
-const _maxZoom = 17.0;
+/// Centro aproximado de la mesh de Guaicaramo (cluster real de nodos).
+const _guaicaramoCenter = LatLng(4.466, -73.058);
+const _initialZoom = 13.0;
+const _minZoom = 6.0;
+const _maxZoom = 19.0;
+
+/// Tope de zoom de las MBTiles offline (las descargamos hasta 16).
+const _offlineMaxNativeZoom = 16;
 
 const _mbtilesAsset = 'assets/maps/guaicaramo.mbtiles';
 const _mbtilesFilename = 'guaicaramo.mbtiles';
+
+const _osmTileUrl = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const _userAgent = 'com.guaicaramo.guaicaramo_control';
 
 class MapScreen extends StatefulWidget {
   final MeshtasticService meshtasticService;
@@ -39,10 +45,14 @@ class _MapScreenState extends State<MapScreen> {
   final MapController _mapController = MapController();
   StreamSubscription<MeshNode>? _positionSubscription;
 
+  /// Ruta al MBTiles offline (si existe). Solo se usa cuando _useOffline=true.
   String? _mbtilesPath;
-  bool _loadingTiles = true;
-  String? _tilesError;
   bool _autoFollowMe = false;
+
+  /// Default online OSM. El usuario puede cambiar al offline (MBTiles) con
+  /// el botón del AppBar. Si no hay MBTiles disponible, el toggle queda
+  /// deshabilitado.
+  bool _useOffline = false;
 
   MeshtasticService get _service => widget.meshtasticService;
 
@@ -78,6 +88,9 @@ class _MapScreenState extends State<MapScreen> {
     setState(() {});
   }
 
+  /// Carga el MBTiles en background (no bloquea el render del mapa online).
+  /// Si falla, _mbtilesPath queda en null y el toggle a offline queda
+  /// deshabilitado.
   Future<void> _initMbtiles() async {
     try {
       final dir = await getApplicationDocumentsDirectory();
@@ -92,20 +105,21 @@ class _MapScreenState extends State<MapScreen> {
       }
 
       if (!mounted) return;
-      setState(() {
-        _mbtilesPath = destPath;
-        _loadingTiles = false;
-      });
+      setState(() => _mbtilesPath = destPath);
+      debugPrint('🗺️ [MAP] MBTiles offline disponible: $destPath');
     } catch (e) {
-      debugPrint('🗺️ [MAP] No se pudo cargar MBTiles: $e');
-      if (!mounted) return;
-      setState(() {
-        _loadingTiles = false;
-        _tilesError =
-            'No se encontró el mapa offline (assets/maps/$_mbtilesFilename).\n'
-            'Genera el archivo con Mobile Atlas Creator y agrégalo al proyecto.';
-      });
+      debugPrint('🗺️ [MAP] MBTiles offline no disponible: $e');
+      // No es error fatal — solo significa que no hay fallback offline.
     }
+  }
+
+  void _toggleOfflineMap() {
+    if (_mbtilesPath == null && !_useOffline) {
+      _showSnack('No hay mapa offline disponible.');
+      return;
+    }
+    setState(() => _useOffline = !_useOffline);
+    _showSnack(_useOffline ? 'Mapa offline (MBTiles).' : 'Mapa online (OSM).');
   }
 
   void _centerOnMyNode() {
@@ -321,45 +335,6 @@ class _MapScreenState extends State<MapScreen> {
     return polylines;
   }
 
-  Widget _buildTilesErrorOverlay() {
-    return Container(
-      color: Colors.white,
-      alignment: Alignment.center,
-      padding: const EdgeInsets.all(32),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.map_outlined, size: 80, color: Colors.grey.shade400),
-          const SizedBox(height: 16),
-          const Text(
-            'Mapa offline no disponible',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 12),
-          Text(
-            _tilesError ?? '',
-            textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.grey.shade700),
-          ),
-          const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: Colors.blue.shade50,
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: const Text(
-              '1) Mobile Atlas Creator → exportar MBTiles\n'
-              '2) Colocar en assets/maps/guaicaramo.mbtiles\n'
-              '3) flutter pub get y reiniciar la app',
-              style: TextStyle(fontSize: 12),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -367,6 +342,14 @@ class _MapScreenState extends State<MapScreen> {
         title: const Text('Mapa de nodos'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
         actions: [
+          IconButton(
+            tooltip: _useOffline ? 'Cambiar a mapa online' : 'Cambiar a mapa offline',
+            icon: Icon(
+              _useOffline ? Icons.wifi_off : Icons.wifi,
+              color: _useOffline ? Colors.orange : null,
+            ),
+            onPressed: _toggleOfflineMap,
+          ),
           IconButton(
             tooltip: _autoFollowMe ? 'Detener seguimiento' : 'Seguir mi nodo',
             icon: Icon(
@@ -379,37 +362,38 @@ class _MapScreenState extends State<MapScreen> {
       ),
       body: Stack(
         children: [
-          if (_loadingTiles)
-            const Center(child: CircularProgressIndicator())
-          else if (_tilesError != null)
-            _buildTilesErrorOverlay()
-          else
-            FlutterMap(
-              mapController: _mapController,
-              options: const MapOptions(
-                initialCenter: _guaicaramoCenter,
-                initialZoom: _initialZoom,
-                minZoom: _minZoom,
-                maxZoom: _maxZoom,
-                interactionOptions: InteractionOptions(
-                  flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
-                ),
+          FlutterMap(
+            mapController: _mapController,
+            options: const MapOptions(
+              initialCenter: _guaicaramoCenter,
+              initialZoom: _initialZoom,
+              minZoom: _minZoom,
+              maxZoom: _maxZoom,
+              interactionOptions: InteractionOptions(
+                flags: InteractiveFlag.all & ~InteractiveFlag.rotate,
               ),
-              children: [
+            ),
+            children: [
+              if (_useOffline && _mbtilesPath != null)
                 TileLayer(
                   tileProvider:
                       MbTilesTileProvider.fromPath(path: _mbtilesPath!),
-                  maxNativeZoom: _maxZoom.toInt(),
+                  maxNativeZoom: _offlineMaxNativeZoom,
+                )
+              else
+                TileLayer(
+                  urlTemplate: _osmTileUrl,
+                  userAgentPackageName: _userAgent,
+                  maxNativeZoom: 19,
                 ),
-                PolylineLayer(polylines: _buildTracks()),
-                MarkerLayer(markers: _buildMarkers()),
-              ],
-            ),
-          if (_tilesError == null && !_loadingTiles)
-            Positioned(
-              right: 16,
-              bottom: 16,
-              child: Column(
+              PolylineLayer(polylines: _buildTracks()),
+              MarkerLayer(markers: _buildMarkers()),
+            ],
+          ),
+          Positioned(
+            right: 16,
+            bottom: 16,
+            child: Column(
                 children: [
                   FloatingActionButton(
                     heroTag: 'fitAll',
@@ -432,9 +416,7 @@ class _MapScreenState extends State<MapScreen> {
                 ],
               ),
             ),
-          if (_service.nodesWithPosition.isEmpty &&
-              _tilesError == null &&
-              !_loadingTiles)
+          if (_service.nodesWithPosition.isEmpty)
             Positioned(
               top: 16,
               left: 16,
