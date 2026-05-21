@@ -168,6 +168,9 @@ class MeshtasticService extends ChangeNotifier {
   int _lastItemListProgress = 0;
   int _lastItemListTotal = -1;
 
+  /// Consultas de item en vuelo: requestId -> Completer.
+  final Map<String, Completer<ItemCheckResult>> _pendingItemChecks = {};
+
   final _itemsUpdatedController = StreamController<void>.broadcast();
 
   Stream<void> get itemsUpdatedStream => _itemsUpdatedController.stream;
@@ -1417,6 +1420,12 @@ class MeshtasticService extends ChangeNotifier {
       }
 
       // Items — respuestas del gateway.
+      // ITEM_RESP|reqId|numero|status[|nombre|concepto|destino|autorizado_por|area]
+      if (text.startsWith('ITEM_RESP|')) {
+        _handleItemResp(text.split('|'));
+        _markPacketProcessed(packetId);
+        return;
+      }
       // LIST_RESP|reqId|seq|total|numero|nombre|concepto|destino|autorizado_por|area
       if (text.startsWith('LIST_RESP|')) {
         _handleListResp(text.split('|'));
@@ -1708,6 +1717,48 @@ class MeshtasticService extends ChangeNotifier {
 
   // ---------- Items: API pública ----------
 
+  /// Consulta un item específico por número (como CONSULTA de placa).
+  /// El gateway responde con ITEM_RESP que incluye status y datos del item
+  /// si existen. Mucho más confiable sobre LoRa que la lista completa.
+  Future<ItemCheckResult> consultItemWithGateway({
+    required String numero,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    if (!isConnected || _client == null) {
+      return ItemCheckResult(
+        status: ItemCheckStatus.error,
+        note: 'Sin conexión al nodo',
+      );
+    }
+
+    final requestId = _newRequestId();
+    final completer = Completer<ItemCheckResult>();
+    _pendingItemChecks[requestId] = completer;
+
+    final message = 'CONSULTA_ITEM|$requestId|$numero';
+    debugPrint('📦 [ITEM] CONSULTA_ITEM → gateway: $message');
+    final sent =
+        await sendChatMessage(message, destinationId: currentGatewayNodeId);
+
+    if (!sent) {
+      _pendingItemChecks.remove(requestId);
+      return ItemCheckResult(
+        status: ItemCheckStatus.error,
+        note: 'No se pudo enviar al gateway',
+      );
+    }
+
+    Future.delayed(timeout, () {
+      final pending = _pendingItemChecks.remove(requestId);
+      if (pending != null && !pending.isCompleted) {
+        debugPrint('⏰ [ITEM] Timeout consulta $requestId');
+        pending.complete(ItemCheckResult(status: ItemCheckStatus.timeout));
+      }
+    });
+
+    return completer.future;
+  }
+
   /// Pide al gateway la lista de items autorizados y no usados.
   /// El gateway responde con N mensajes LIST_RESP (uno por item).
   /// La UI escucha [itemsUpdatedStream] para repintar cada vez que llega
@@ -1821,6 +1872,68 @@ class MeshtasticService extends ChangeNotifier {
     }
     _saveItemsCache();
     debugPrint('📦 [ITEM] Lista completa: ${items.length} items');
+    _itemsUpdatedController.add(null);
+    notifyListeners();
+  }
+
+  /// Procesa ITEM_RESP del gateway en respuesta a CONSULTA_ITEM.
+  /// Formato (los pipes son separadores literales):
+  ///
+  ///   `ITEM_RESP|reqId|numero|AUTORIZADO|nombre|concepto|destino|autorizado_por|area`
+  ///   `ITEM_RESP|reqId|numero|YA_USADO|nombre|concepto|destino|autorizado_por|area`
+  ///   `ITEM_RESP|reqId|numero|NO_AUTORIZADO`
+  ///   `ITEM_RESP|reqId|numero|NO_EXISTE`
+  ///   `ITEM_RESP|reqId|numero|ERROR|motivo`
+  void _handleItemResp(List<String> parts) {
+    if (parts.length < 4) return;
+    final reqId = parts[1];
+    final numero = parts[2];
+    final status = parts[3];
+    final completer = _pendingItemChecks.remove(reqId);
+    debugPrint(
+      '📦 [ITEM] ITEM_RESP $reqId numero=$numero → $status (pendiente: ${completer != null})',
+    );
+    if (completer == null || completer.isCompleted) return;
+
+    ItemCheckResult result;
+    switch (status) {
+      case 'AUTORIZADO':
+      case 'YA_USADO':
+        final item = Item(
+          numero: numero,
+          nombre: parts.length > 4 ? parts[4] : '',
+          concepto: parts.length > 5 && parts[5].isNotEmpty ? parts[5] : null,
+          destino: parts.length > 6 && parts[6].isNotEmpty ? parts[6] : null,
+          autorizadoPor:
+              parts.length > 7 && parts[7].isNotEmpty ? parts[7] : null,
+          area: parts.length > 8 && parts[8].isNotEmpty ? parts[8] : null,
+          usado: status == 'YA_USADO',
+        );
+        // Cache local para que reaparezca en "Salidas recientes" si aplica.
+        _knownItems[numero] = item;
+        _saveItemsCache();
+        result = ItemCheckResult(
+          status: status == 'AUTORIZADO'
+              ? ItemCheckStatus.authorized
+              : ItemCheckStatus.alreadyUsed,
+          item: item,
+        );
+        break;
+      case 'NO_AUTORIZADO':
+        result = ItemCheckResult(status: ItemCheckStatus.notAuthorized);
+        break;
+      case 'NO_EXISTE':
+        result = ItemCheckResult(status: ItemCheckStatus.notFound);
+        break;
+      case 'ERROR':
+      default:
+        result = ItemCheckResult(
+          status: ItemCheckStatus.error,
+          note: parts.length > 4 ? parts[4] : null,
+        );
+        break;
+    }
+    completer.complete(result);
     _itemsUpdatedController.add(null);
     notifyListeners();
   }

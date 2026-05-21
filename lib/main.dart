@@ -527,7 +527,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
             const NavigationDestination(
               icon: Icon(Icons.directions_car_outlined),
               selectedIcon: Icon(Icons.directions_car),
-              label: 'Recepción',
+              label: 'Ctrl',
             ),
             NavigationDestination(
               icon: Badge(
@@ -540,7 +540,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
                 isLabelVisible: pendingCount > 0,
                 child: const Icon(Icons.list_alt),
               ),
-              label: 'Solicitudes',
+              label: 'Sup',
             ),
             NavigationDestination(
               icon: Badge(

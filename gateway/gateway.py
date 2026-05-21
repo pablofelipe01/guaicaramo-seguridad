@@ -720,6 +720,68 @@ def handle_listar_items(interface, from_num: int, parts: list[str]) -> None:
         send_text(interface, from_num, msg)
 
 
+def handle_consulta_item(interface, from_num: int, parts: list[str]) -> None:
+    """CONSULTA_ITEM|<requestId>|<numero>.
+
+    Responde con ITEM_RESP|<requestId>|<numero>|<status>[...|<campos>].
+    status: AUTORIZADO / YA_USADO / NO_AUTORIZADO / NO_EXISTE / ERROR
+    """
+    if len(parts) < 3:
+        log.warning("CONSULTA_ITEM formato inválido: %s", parts)
+        return
+    request_id = parts[1]
+    numero = parts[2].strip()
+    log.info("📦 CONSULTA_ITEM req=%s numero=%s de %s",
+             request_id, numero, _node_hex(from_num))
+
+    try:
+        record = airtable_find_item(numero)
+        if record is None:
+            send_text(
+                interface, from_num,
+                f"ITEM_RESP|{request_id}|{numero}|NO_EXISTE",
+            )
+            return
+
+        f = record.get("fields", {})
+        autorizado = bool(f.get("autorizado"))
+        usado = bool(f.get("usado"))
+
+        if not autorizado:
+            send_text(
+                interface, from_num,
+                f"ITEM_RESP|{request_id}|{numero}|NO_AUTORIZADO",
+            )
+            return
+
+        status = "YA_USADO" if usado else "AUTORIZADO"
+        nombre = _truncate(f.get("nombre", ""), 30)
+        concepto = _truncate(f.get("concepto", ""), 70)
+        destino = _truncate(f.get("destino", ""), 25)
+        autorizado_por = _truncate(f.get("autorizado_por", ""), 25)
+        area = _truncate(f.get("area", ""), 20)
+
+        msg = (
+            f"ITEM_RESP|{request_id}|{numero}|{status}|"
+            f"{nombre}|{concepto}|{destino}|"
+            f"{autorizado_por}|{area}"
+        )
+        send_text(interface, from_num, msg)
+
+    except AirtableError as e:
+        log.error("AirtableError en CONSULTA_ITEM: %s", e)
+        send_text(
+            interface, from_num,
+            f"ITEM_RESP|{request_id}|{numero}|ERROR|{str(e)[:50]}",
+        )
+    except Exception:
+        log.error("Excepción en CONSULTA_ITEM:\n%s", traceback.format_exc())
+        send_text(
+            interface, from_num,
+            f"ITEM_RESP|{request_id}|{numero}|ERROR|interno",
+        )
+
+
 def handle_salida_item(interface, from_num: int, parts: list[str]) -> None:
     """SALIDA_ITEM|<numero>. Marca el item como usado en Airtable."""
     if len(parts) < 2:
@@ -755,6 +817,7 @@ HANDLERS = {
     "SALIDA_V": handle_salida,
     "REGISTRO_MANUAL": handle_registro_manual,
     "LISTAR_ITEMS": handle_listar_items,
+    "CONSULTA_ITEM": handle_consulta_item,
     "SALIDA_ITEM": handle_salida_item,
 }
 

@@ -617,6 +617,32 @@ class Item {
   int get hashCode => numero.hashCode;
 }
 
+/// Estado posible de una consulta de item al gateway.
+enum ItemCheckStatus {
+  authorized,    // existe, autorizado=true, usado=false → portero puede registrar salida
+  alreadyUsed,   // existe pero ya fue marcado como usado (sale solo una vez)
+  notAuthorized, // existe pero autorizado=false (admin no lo aprobó)
+  notFound,      // numero no existe en Airtable
+  timeout,
+  error,
+}
+
+/// Resultado de [MeshtasticService.consultItemWithGateway].
+class ItemCheckResult {
+  final ItemCheckStatus status;
+  final Item? item;
+  final String? note;
+
+  ItemCheckResult({required this.status, this.item, this.note});
+
+  bool get isAuthorized => status == ItemCheckStatus.authorized;
+  bool get isAlreadyUsed => status == ItemCheckStatus.alreadyUsed;
+  bool get isNotAuthorized => status == ItemCheckStatus.notAuthorized;
+  bool get isNotFound => status == ItemCheckStatus.notFound;
+  bool get isTimeout => status == ItemCheckStatus.timeout;
+  bool get isError => status == ItemCheckStatus.error;
+}
+
 class ChatDestination {
   final String displayName;
   final int? channel;
