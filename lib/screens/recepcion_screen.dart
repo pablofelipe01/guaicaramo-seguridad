@@ -4,7 +4,10 @@ import 'package:flutter/services.dart';
 import '../models/data_models.dart';
 import '../services/meshtastic_service.dart';
 
-enum _AccessMode { vehiculo, peaton }
+/// Tipo de acceso a registrar. La rama [persona] reemplaza al antiguo
+/// "peatón" — un acompañante también es una persona, así que el portero
+/// los registra de a uno cuando llegan en un carro.
+enum _AccessMode { vehiculo, persona }
 
 enum _RecepcionStage {
   idle,
@@ -34,21 +37,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   final _nombreController = TextEditingController();
   final _porteroCommentController = TextEditingController();
 
-  /// 4 inputs de CC para acompañantes (solo aplica en modo Vehículo).
-  final List<TextEditingController> _acompCcControllers =
-      List.generate(4, (_) => TextEditingController());
-
-  /// Resultado individual de la consulta de cada acompañante (mismo índice
-  /// que el controller). Null = no se intentó (campo vacío) o aún no hay
-  /// resultado.
-  List<PersonCheckResult?> _acompResults = List.filled(4, null);
-
-  bool _showAcompanantes = false;
-
   _AccessMode _mode = _AccessMode.vehiculo;
   _RecepcionStage _stage = _RecepcionStage.idle;
 
-  // Resultados de la última consulta
   PlateCheckResult? _lastPlateCheck;
   PersonCheckResult? _lastPersonCheck;
   VehicleResponse? _lastVehicleResponse;
@@ -82,36 +73,8 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     _placaController.dispose();
     _nombreController.dispose();
     _porteroCommentController.dispose();
-    for (final c in _acompCcControllers) {
-      c.dispose();
-    }
     super.dispose();
   }
-
-  /// CCs de acompañantes ingresados, en el orden del UI (sin vacíos).
-  List<String> get _acompCedulasFilled => _acompCcControllers
-      .map((c) => c.text.trim())
-      .where((cc) => cc.isNotEmpty)
-      .toList();
-
-  /// Acompañantes resueltos a partir de _acompResults — los que fueron
-  /// aprobados con nombre y los rechazados/desconocidos sin nombre.
-  List<Acompanante> get _acompResolved {
-    final out = <Acompanante>[];
-    for (var i = 0; i < 4; i++) {
-      final cc = _acompCcControllers[i].text.trim();
-      if (cc.isEmpty) continue;
-      final res = _acompResults[i];
-      out.add(Acompanante(
-        cedula: cc,
-        nombre: (res != null && res.isApproved) ? res.personName : null,
-      ));
-    }
-    return out;
-  }
-
-  bool get _hasAcompFailures =>
-      _acompResults.any((r) => r != null && !r.isApproved);
 
   void _onServiceChange() {
     if (mounted) setState(() {});
@@ -130,11 +93,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _placaController.clear();
       _nombreController.clear();
       _porteroCommentController.clear();
-      for (final c in _acompCcControllers) {
-        c.clear();
-      }
-      _acompResults = List.filled(4, null);
-      _showAcompanantes = false;
     });
     _supervisorTimeoutTimer?.cancel();
   }
@@ -156,117 +114,38 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     setState(() {
       _stage = _RecepcionStage.checking;
       _errorMessage = null;
-      _acompResults = List.filled(4, null);
     });
 
     if (_isVehicle) {
-      await _verifyVehicleAndAcomp();
-    } else {
-      await _verifyPerson();
-    }
-  }
-
-  Future<void> _verifyVehicleAndAcomp() async {
-    // Lanzar driver + acompañantes en paralelo.
-    final driverFuture = _service.checkPlateWithGateway(
-      cedula: _cedula,
-      placa: _placa,
-    );
-
-    final acompIndexes = <int>[];
-    final acompFutures = <Future<PersonCheckResult>>[];
-    for (var i = 0; i < 4; i++) {
-      final cc = _acompCcControllers[i].text.trim();
-      if (cc.isEmpty) continue;
-      acompIndexes.add(i);
-      acompFutures.add(_service.checkPersonWithGateway(cedula: cc));
-    }
-
-    final driverResult = await driverFuture;
-    final acompResults = await Future.wait(acompFutures);
-
-    if (!mounted) return;
-
-    // Persistir resultados por índice (los slots vacíos quedan null).
-    final newAcompResults = List<PersonCheckResult?>.filled(4, null);
-    for (var k = 0; k < acompIndexes.length; k++) {
-      newAcompResults[acompIndexes[k]] = acompResults[k];
-    }
-
-    setState(() {
-      _lastPlateCheck = driverResult;
-      _acompResults = newAcompResults;
-
-      // Si algún check fue timeout o error → error global.
-      final anyError = driverResult.isTimeout ||
-          driverResult.isError ||
-          acompResults
-              .any((r) => r.status == PlateCheckStatus.timeout || r.isError);
-      if (anyError) {
-        _stage = _RecepcionStage.error;
-        if (driverResult.isTimeout ||
-            acompResults.any((r) => r.status == PlateCheckStatus.timeout)) {
+      final result = await _service.checkPlateWithGateway(
+        cedula: _cedula,
+        placa: _placa,
+      );
+      if (!mounted) return;
+      setState(() {
+        _lastPlateCheck = result;
+        _stage = _stageFromStatus(result.status);
+        if (result.isTimeout) {
           _errorMessage =
               'El gateway no respondió a tiempo. Verifica conexión LoRa.';
-        } else {
-          final acompError = acompResults
-              .where((r) => r.isError)
-              .map((r) => r.note)
-              .whereType<String>()
-              .firstOrNull;
-          _errorMessage = driverResult.note ??
-              acompError ??
-              'Error consultando el gateway.';
+        } else if (result.isError) {
+          _errorMessage = result.note ?? 'Error consultando el gateway.';
         }
-        return;
-      }
-
-      // Todos respondieron OK (approved o notApproved). Agregar.
-      final allApproved = driverResult.isApproved &&
-          acompResults.every((r) => r.isApproved);
-      if (allApproved) {
-        _stage = _RecepcionStage.approvedByGateway;
-      } else {
-        _stage = _RecepcionStage.notApproved;
-        // Pre-rellenar comentario con quién falló para ayudar al portero.
-        _porteroCommentController.text = _buildAutoComment(
-          driverApproved: driverResult.isApproved,
-          acompResults: newAcompResults,
-        );
-      }
-    });
-  }
-
-  String _buildAutoComment({
-    required bool driverApproved,
-    required List<PersonCheckResult?> acompResults,
-  }) {
-    final issues = <String>[];
-    if (!driverApproved) issues.add('placa $_placa');
-    for (var i = 0; i < 4; i++) {
-      final r = acompResults[i];
-      if (r == null) continue;
-      if (!r.isApproved) {
-        issues.add('CC ${_acompCcControllers[i].text.trim()}');
-      }
+      });
+    } else {
+      final result = await _service.checkPersonWithGateway(cedula: _cedula);
+      if (!mounted) return;
+      setState(() {
+        _lastPersonCheck = result;
+        _stage = _stageFromStatus(result.status);
+        if (result.isTimeout) {
+          _errorMessage =
+              'El gateway no respondió a tiempo. Verifica conexión LoRa.';
+        } else if (result.isError) {
+          _errorMessage = result.note ?? 'Error consultando el gateway.';
+        }
+      });
     }
-    if (issues.isEmpty) return _porteroCommentController.text;
-    return 'Faltan autorizar: ${issues.join(", ")}';
-  }
-
-  Future<void> _verifyPerson() async {
-    final result = await _service.checkPersonWithGateway(cedula: _cedula);
-    if (!mounted) return;
-    setState(() {
-      _lastPersonCheck = result;
-      _stage = _stageFromStatus(result.status);
-      if (result.isTimeout) {
-        _errorMessage =
-            'El gateway no respondió a tiempo. Verifica conexión LoRa.';
-      } else if (result.isError) {
-        _errorMessage = result.note ?? 'Error consultando el gateway.';
-      }
-    });
   }
 
   _RecepcionStage _stageFromStatus(PlateCheckStatus status) {
@@ -283,24 +162,17 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
 
   Future<void> _registerEntryFromGateway() async {
     if (_isVehicle) {
-      final acompanantes = _acompResolved;
       _service.addVehicleEntry(
         cedula: _cedula,
         placa: _placa,
         approvedBy: 'GATEWAY',
-        acompanantes: acompanantes,
       );
       await _service.sendEntryToGateway(
         cedula: _cedula,
         placa: _placa,
         approvedBy: 'GATEWAY',
-        acompanantes: acompanantes,
       );
-      _showSnack(
-        acompanantes.isEmpty
-            ? 'Entrada registrada: $_placa'
-            : 'Entrada registrada: $_placa (+${acompanantes.length} acomp)',
-      );
+      _showSnack('Entrada registrada: $_placa');
     } else {
       final nombre = _lastPersonCheck?.personName ?? _nombre;
       _service.addPersonEntry(
@@ -333,7 +205,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             placa: _placa,
             supervisorNodeId: supervisor.nodeId,
             comment: comment,
-            acompananteCedulas: _acompCedulasFilled,
           )
         : await _service.requestPersonApproval(
             cedula: _cedula,
@@ -378,13 +249,11 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       }
     });
 
-    final acompanantes = _acompResolved;
     if (response.isApproved) {
       _service.addVehicleEntry(
         cedula: _cedula,
         placa: _placa,
         approvedBy: response.supervisorName,
-        acompanantes: acompanantes,
       );
       _service.sendRegistroManualToGateway(
         status: 'APROBADO',
@@ -392,7 +261,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         placa: _placa,
         supervisor: response.supervisorName,
         comment: response.comment,
-        acompanantes: acompanantes,
       );
     } else if (response.isDenied) {
       _service.sendRegistroManualToGateway(
@@ -401,7 +269,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         placa: _placa,
         supervisor: response.supervisorName,
         comment: response.comment,
-        acompanantes: acompanantes,
       );
     }
   }
@@ -501,9 +368,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           label: Text('Vehículo'),
         ),
         ButtonSegment(
-          value: _AccessMode.peaton,
-          icon: Icon(Icons.directions_walk),
-          label: Text('Peatón'),
+          value: _AccessMode.persona,
+          icon: Icon(Icons.person),
+          label: Text('Persona'),
         ),
       ],
       selected: {_mode},
@@ -541,7 +408,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             },
           ),
           const SizedBox(height: 12),
-          if (_isVehicle) ...[
+          if (_isVehicle)
             TextFormField(
               controller: _placaController,
               textCapitalization: TextCapitalization.characters,
@@ -564,10 +431,8 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 if (v.trim().length < 4) return 'Placa muy corta';
                 return null;
               },
-            ),
-            const SizedBox(height: 12),
-            _buildAcompanantesSection(),
-          ] else
+            )
+          else
             TextFormField(
               controller: _nombreController,
               textCapitalization: TextCapitalization.words,
@@ -643,7 +508,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           color: Colors.green,
           title: 'AUTORIZADO',
           subtitle: _approvedSubtitle,
-          extraContent: _buildAcompanantesStatusList(),
           primaryButton: ElevatedButton.icon(
             onPressed: _registerEntryFromGateway,
             icon: const Icon(Icons.login),
@@ -705,7 +569,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           comment: comment,
           info: _isVehicle
               ? 'Vehículo registrado en la lista de abajo.'
-              : 'Peatón registrado en la lista de abajo.',
+              : 'Persona registrada en la lista de abajo.',
           onReset: _resetForm,
         );
 
@@ -767,17 +631,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     final supervisors = _service.onlineNodes
         .where((n) => n.nodeId != _service.currentGatewayNodeId)
         .toList();
-    final driverApproved = _lastPlateCheck?.isApproved ?? false;
-    final String label;
-    if (!_isVehicle) {
-      label = 'La cédula $_cedula no está en la lista de personas.';
-    } else if (!driverApproved && _hasAcompFailures) {
-      label = 'La placa $_placa y algunos acompañantes no están autorizados.';
-    } else if (!driverApproved) {
-      label = 'La placa $_placa no está en la lista.';
-    } else {
-      label = 'Algunos acompañantes no están autorizados.';
-    }
+    final label = _isVehicle
+        ? 'La placa $_placa no está en la lista.'
+        : 'La cédula $_cedula no está en la lista de personas.';
 
     return Card(
       color: Colors.orange.shade50,
@@ -807,7 +663,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
               '$label Solicita aprobación manual a un supervisor.',
               style: const TextStyle(fontSize: 14),
             ),
-            _buildAcompanantesStatusList(),
             const SizedBox(height: 16),
             TextField(
               controller: _porteroCommentController,
@@ -897,7 +752,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             const Icon(Icons.list, size: 20),
             const SizedBox(width: 8),
             Text(
-              'Activos: ${vehiclesActive.length} 🚗 · ${personsActive.length} 🚶',
+              'Activos: ${vehiclesActive.length} 🚗 · ${personsActive.length} 👤',
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
           ],
@@ -979,7 +834,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         child: Row(
           children: [
             Icon(
-              entry.hasExited ? Icons.logout : Icons.directions_walk,
+              entry.hasExited ? Icons.logout : Icons.person,
               color: entry.hasExited ? Colors.grey : Colors.purple,
               size: 28,
             ),
@@ -1031,146 +886,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
 
   bool get _isFormStage =>
       _stage == _RecepcionStage.idle || _stage == _RecepcionStage.checking;
-
-  Widget _buildAcompanantesSection() {
-    final filled = _acompCedulasFilled.length;
-    return Card(
-      elevation: 0,
-      color: Colors.grey.shade50,
-      shape: RoundedRectangleBorder(
-        side: BorderSide(color: Colors.grey.shade300),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        children: [
-          InkWell(
-            onTap: () => setState(() => _showAcompanantes = !_showAcompanantes),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 16,
-                vertical: 12,
-              ),
-              child: Row(
-                children: [
-                  Icon(Icons.group_add, color: Colors.grey.shade700, size: 22),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      filled == 0
-                          ? 'Acompañantes (opcional)'
-                          : 'Acompañantes: $filled',
-                      style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                  Icon(
-                    _showAcompanantes
-                        ? Icons.expand_less
-                        : Icons.expand_more,
-                    color: Colors.grey.shade600,
-                  ),
-                ],
-              ),
-            ),
-          ),
-          if (_showAcompanantes)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-              child: Column(
-                children: [
-                  for (var i = 0; i < 4; i++) ...[
-                    TextFormField(
-                      controller: _acompCcControllers[i],
-                      keyboardType: TextInputType.number,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.digitsOnly,
-                        LengthLimitingTextInputFormatter(15),
-                      ],
-                      decoration: InputDecoration(
-                        labelText: 'Acompañante ${i + 1} — Cédula',
-                        border: const OutlineInputBorder(),
-                        prefixIcon: const Icon(Icons.person_outline),
-                        isDense: true,
-                      ),
-                    ),
-                    if (i < 3) const SizedBox(height: 8),
-                  ],
-                  Padding(
-                    padding: const EdgeInsets.only(top: 8),
-                    child: Text(
-                      'Las cédulas se verifican contra la tabla Personas. Si alguna no está autorizada, se pide aprobación al supervisor.',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.grey.shade600,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAcompanantesStatusList() {
-    if (!_isVehicle) return const SizedBox.shrink();
-    final hasAny = _acompResults.any((r) => r != null);
-    if (!hasAny) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(top: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'Acompañantes:',
-            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
-          ),
-          const SizedBox(height: 4),
-          for (var i = 0; i < 4; i++)
-            if (_acompResults[i] != null)
-              _buildAcompStatusRow(i, _acompResults[i]!),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAcompStatusRow(int i, PersonCheckResult res) {
-    final cc = _acompCcControllers[i].text.trim();
-    final IconData icon;
-    final Color color;
-    final String text;
-
-    if (res.isApproved) {
-      icon = Icons.check_circle;
-      color = Colors.green;
-      final name = res.personName;
-      text = (name != null && name.isNotEmpty) ? '$cc — $name' : cc;
-    } else if (res.isNotApproved) {
-      icon = Icons.cancel;
-      color = Colors.red;
-      text = '$cc — No autorizado';
-    } else {
-      icon = Icons.help_outline;
-      color = Colors.orange;
-      text = '$cc — ${res.note ?? "Error"}';
-    }
-
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 2),
-      child: Row(
-        children: [
-          Icon(icon, color: color, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(text, style: const TextStyle(fontSize: 13)),
-          ),
-        ],
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1234,7 +949,6 @@ class _ResultCard extends StatelessWidget {
   final String? comment;
   final String? info;
   final Widget? primaryButton;
-  final Widget? extraContent;
   final VoidCallback onReset;
 
   const _ResultCard({
@@ -1245,7 +959,6 @@ class _ResultCard extends StatelessWidget {
     this.comment,
     this.info,
     this.primaryButton,
-    this.extraContent,
     required this.onReset,
   });
 
@@ -1304,7 +1017,6 @@ class _ResultCard extends StatelessWidget {
                 textAlign: TextAlign.center,
               ),
             ],
-            ?extraContent,
             const SizedBox(height: 16),
             ?primaryButton,
             const SizedBox(height: 8),
