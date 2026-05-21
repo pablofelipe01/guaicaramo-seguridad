@@ -140,6 +140,17 @@ class MeshtasticService extends ChangeNotifier {
   final Map<String, Completer<PlateCheckResult>> _pendingPlateChecks = {};
   final Map<String, Completer<PersonCheckResult>> _pendingPersonChecks = {};
 
+  /// Contador secuencial para garantizar requestIds únicos cuando se disparan
+  /// múltiples consultas en el mismo milisegundo (driver + acompañantes en
+  /// paralelo). Sin esto, dos calls colisionan en `_pendingChecks[id]` y la
+  /// primera Completer queda huérfana → timeout silencioso.
+  int _requestSeq = 0;
+
+  String _newRequestId() {
+    _requestSeq = (_requestSeq + 1) & 0xFFFF;
+    return '${DateTime.now().millisecondsSinceEpoch}-$_requestSeq';
+  }
+
   final _messageController = StreamController<ChatMessage>.broadcast();
   final _vehicleRequestController = StreamController<VehicleRequest>.broadcast();
   final _vehicleResponseController = StreamController<VehicleResponse>.broadcast();
@@ -826,7 +837,7 @@ class MeshtasticService extends ChangeNotifier {
       );
     }
 
-    final requestId = DateTime.now().millisecondsSinceEpoch.toString();
+    final requestId = _newRequestId();
     final completer = Completer<PlateCheckResult>();
     _pendingPlateChecks[requestId] = completer;
 
@@ -991,7 +1002,7 @@ class MeshtasticService extends ChangeNotifier {
       );
     }
 
-    final requestId = DateTime.now().millisecondsSinceEpoch.toString();
+    final requestId = _newRequestId();
     final completer = Completer<PersonCheckResult>();
     _pendingPersonChecks[requestId] = completer;
 
