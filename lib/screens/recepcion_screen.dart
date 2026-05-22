@@ -4,10 +4,11 @@ import 'package:flutter/services.dart';
 import '../models/data_models.dart';
 import '../services/meshtastic_service.dart';
 
-/// Tipo de acceso a registrar. La rama [persona] reemplaza al antiguo
-/// "peatón" — un acompañante también es una persona, así que el portero
-/// los registra de a uno cuando llegan en un carro.
-enum _AccessMode { vehiculo, persona }
+/// Tipo de acceso a registrar.
+/// - [vehiculo]: CC + Placa, consulta tabla Placas.
+/// - [persona]: solo CC (+ nombre opcional para aprobación manual), tabla Personas.
+/// - [finDeSemana]: solo CC, tabla FinDeSemana (whitelist simple).
+enum _AccessMode { vehiculo, persona, finDeSemana }
 
 enum _RecepcionStage {
   idle,
@@ -103,6 +104,8 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   String get _porteroComment => _porteroCommentController.text.trim();
 
   bool get _isVehicle => _mode == _AccessMode.vehiculo;
+  bool get _isPersona => _mode == _AccessMode.persona;
+  bool get _isFinDeSemana => _mode == _AccessMode.finDeSemana;
 
   Future<void> _verify() async {
     if (!_formKey.currentState!.validate()) return;
@@ -133,7 +136,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         }
       });
     } else {
-      final result = await _service.checkPersonWithGateway(cedula: _cedula);
+      final result = _isFinDeSemana
+          ? await _service.checkFinDeSWithGateway(cedula: _cedula)
+          : await _service.checkPersonWithGateway(cedula: _cedula);
       if (!mounted) return;
       setState(() {
         _lastPersonCheck = result;
@@ -175,15 +180,27 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _showSnack('Entrada registrada: $_placa');
     } else {
       final nombre = _lastPersonCheck?.personName ?? _nombre;
-      _service.addPersonEntry(
-        cedula: _cedula,
-        nombre: nombre,
-        approvedBy: 'GATEWAY',
-      );
-      await _service.sendPersonEntryToGateway(
-        cedula: _cedula,
-        approvedBy: 'GATEWAY',
-      );
+      if (_isFinDeSemana) {
+        _service.addFinDeSEntry(
+          cedula: _cedula,
+          nombre: nombre,
+          approvedBy: 'GATEWAY',
+        );
+        await _service.sendFinDeSEntryToGateway(
+          cedula: _cedula,
+          approvedBy: 'GATEWAY',
+        );
+      } else {
+        _service.addPersonEntry(
+          cedula: _cedula,
+          nombre: nombre,
+          approvedBy: 'GATEWAY',
+        );
+        await _service.sendPersonEntryToGateway(
+          cedula: _cedula,
+          approvedBy: 'GATEWAY',
+        );
+      }
       _showSnack('Entrada registrada: $nombre');
     }
     _resetForm();
@@ -199,18 +216,27 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     setState(() => _stage = _RecepcionStage.waitingSupervisor);
 
     final comment = _porteroComment.isNotEmpty ? _porteroComment : null;
-    final sent = _isVehicle
-        ? await _service.requestVehicleApproval(
-            cedula: _cedula,
-            placa: _placa,
-            supervisorNodeId: supervisor.nodeId,
-            comment: comment,
-          )
-        : await _service.requestPersonApproval(
-            cedula: _cedula,
-            supervisorNodeId: supervisor.nodeId,
-            comment: comment,
-          );
+    bool sent;
+    if (_isVehicle) {
+      sent = await _service.requestVehicleApproval(
+        cedula: _cedula,
+        placa: _placa,
+        supervisorNodeId: supervisor.nodeId,
+        comment: comment,
+      );
+    } else if (_isFinDeSemana) {
+      sent = await _service.requestFinDeSApproval(
+        cedula: _cedula,
+        supervisorNodeId: supervisor.nodeId,
+        comment: comment,
+      );
+    } else {
+      sent = await _service.requestPersonApproval(
+        cedula: _cedula,
+        supervisorNodeId: supervisor.nodeId,
+        comment: comment,
+      );
+    }
 
     if (!mounted) return;
 
@@ -288,25 +314,49 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       }
     });
 
+    final nombreFallback = _nombre.isNotEmpty ? _nombre : '(sin nombre)';
     if (response.isApproved) {
-      _service.addPersonEntry(
-        cedula: _cedula,
-        nombre: _nombre.isNotEmpty ? _nombre : '(sin nombre)',
-        approvedBy: response.supervisorName,
-      );
-      _service.sendRegistroManualPersonToGateway(
-        status: 'APROBADO',
-        cedula: _cedula,
-        supervisor: response.supervisorName,
-        comment: response.comment,
-      );
+      if (_isFinDeSemana) {
+        _service.addFinDeSEntry(
+          cedula: _cedula,
+          nombre: nombreFallback,
+          approvedBy: response.supervisorName,
+        );
+        _service.sendRegistroManualFinDeSToGateway(
+          status: 'APROBADO',
+          cedula: _cedula,
+          supervisor: response.supervisorName,
+          comment: response.comment,
+        );
+      } else {
+        _service.addPersonEntry(
+          cedula: _cedula,
+          nombre: nombreFallback,
+          approvedBy: response.supervisorName,
+        );
+        _service.sendRegistroManualPersonToGateway(
+          status: 'APROBADO',
+          cedula: _cedula,
+          supervisor: response.supervisorName,
+          comment: response.comment,
+        );
+      }
     } else if (response.isDenied) {
-      _service.sendRegistroManualPersonToGateway(
-        status: 'NEGADO',
-        cedula: _cedula,
-        supervisor: response.supervisorName,
-        comment: response.comment,
-      );
+      if (_isFinDeSemana) {
+        _service.sendRegistroManualFinDeSToGateway(
+          status: 'NEGADO',
+          cedula: _cedula,
+          supervisor: response.supervisorName,
+          comment: response.comment,
+        );
+      } else {
+        _service.sendRegistroManualPersonToGateway(
+          status: 'NEGADO',
+          cedula: _cedula,
+          supervisor: response.supervisorName,
+          comment: response.comment,
+        );
+      }
     }
   }
 
@@ -372,8 +422,14 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           icon: Icon(Icons.person),
           label: Text('Persona'),
         ),
+        ButtonSegment(
+          value: _AccessMode.finDeSemana,
+          icon: Icon(Icons.weekend),
+          label: Text('Fin de S'),
+        ),
       ],
       selected: {_mode},
+      showSelectedIcon: false,
       onSelectionChanged: (s) {
         if (_stage != _RecepcionStage.idle &&
             _stage != _RecepcionStage.checking) {
@@ -432,7 +488,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 return null;
               },
             )
-          else
+          else if (_isPersona)
             TextFormField(
               controller: _nombreController,
               textCapitalization: TextCapitalization.words,
@@ -442,6 +498,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 prefixIcon: Icon(Icons.person),
               ),
             ),
+          // En modo fin-de-semana solo se pide la CC.
           const SizedBox(height: 20),
           ElevatedButton.icon(
             onPressed: _stage == _RecepcionStage.checking || !_service.isConnected
@@ -468,9 +525,14 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           : 'Placa $_placa autorizada';
     }
     final person = _lastPersonCheck?.personName;
-    return (person != null && person.isNotEmpty)
-        ? 'Persona: $person'
+    final area = _lastPersonCheck?.area;
+    final base = (person != null && person.isNotEmpty)
+        ? (_isFinDeSemana ? 'Fin de S: $person' : 'Persona: $person')
         : 'CC $_cedula autorizada';
+    if (_isFinDeSemana && area != null && area.isNotEmpty) {
+      return '$base · $area';
+    }
+    return base;
   }
 
   Widget _buildStatusCard() {
@@ -631,9 +693,14 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     final supervisors = _service.onlineNodes
         .where((n) => n.nodeId != _service.currentGatewayNodeId)
         .toList();
-    final label = _isVehicle
-        ? 'La placa $_placa no está en la lista.'
-        : 'La cédula $_cedula no está en la lista de personas.';
+    final String label;
+    if (_isVehicle) {
+      label = 'La placa $_placa no está en la lista.';
+    } else if (_isFinDeSemana) {
+      label = 'La cédula $_cedula no está en la lista de fin de semana.';
+    } else {
+      label = 'La cédula $_cedula no está en la lista de personas.';
+    }
 
     return Card(
       color: Colors.orange.shade50,

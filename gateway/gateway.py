@@ -57,6 +57,9 @@ AIRTABLE_PLACAS_TABLE = os.getenv("AIRTABLE_PLACAS_TABLE", "Placas").strip()
 AIRTABLE_REGISTROS_TABLE = os.getenv("AIRTABLE_REGISTROS_TABLE", "Registros").strip()
 AIRTABLE_PERSONAS_TABLE = os.getenv("AIRTABLE_PERSONAS_TABLE", "Personas").strip()
 AIRTABLE_ITEMS_TABLE = os.getenv("AIRTABLE_ITEMS_TABLE", "Items").strip()
+AIRTABLE_FINDESEMANA_TABLE = os.getenv(
+    "AIRTABLE_FINDESEMANA_TABLE", "FinDeSemana"
+).strip()
 
 # Conexión al nodo Meshtastic. Una de las tres debe estar definida.
 MESHTASTIC_SERIAL = os.getenv("MESHTASTIC_SERIAL", "").strip()  # ej: /dev/ttyUSB0
@@ -173,6 +176,56 @@ def airtable_find_placa(placa: str) -> dict[str, Any] | None:
     return records[0] if records else None
 
 
+def airtable_find_findesemana(cedula: str) -> dict[str, Any] | None:
+    """Busca una cédula exacta en la tabla FinDeSemana."""
+    cedula_clean = cedula.strip()
+    formula = f"{{cedula}} = '{cedula_clean}'"
+    params = {"filterByFormula": formula, "maxRecords": 1}
+    resp = requests.get(
+        _airtable_url(AIRTABLE_FINDESEMANA_TABLE),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"GET FinDeSemana HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    records = resp.json().get("records", [])
+    return records[0] if records else None
+
+
+def airtable_find_active_findesemana(cedula: str) -> dict[str, Any] | None:
+    """Busca el último Registro de entrada fin-de-semana sin salida."""
+    cedula_clean = cedula.strip()
+    formula = (
+        "AND("
+        f"{{cedula}} = '{cedula_clean}',"
+        "{tipo} = 'ENTRADA',"
+        "{categoria} = 'FIN_DE_SEMANA',"
+        "{exit_time} = BLANK()"
+        ")"
+    )
+    params = {
+        "filterByFormula": formula,
+        "maxRecords": 1,
+        "sort[0][field]": "entry_time",
+        "sort[0][direction]": "desc",
+    }
+    resp = requests.get(
+        _airtable_url(AIRTABLE_REGISTROS_TABLE),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"GET Registros HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    records = resp.json().get("records", [])
+    return records[0] if records else None
+
+
 def airtable_find_persona(cedula: str) -> dict[str, Any] | None:
     """Busca una cédula exacta en la tabla Personas."""
     cedula_clean = cedula.strip()
@@ -193,10 +246,12 @@ def airtable_find_persona(cedula: str) -> dict[str, Any] | None:
 
 
 def airtable_create_registro(fields: dict[str, Any]) -> str:
+    # typecast=true permite que Airtable cree nuevas opciones de singleSelect
+    # al vuelo (ej: categoria='FIN_DE_SEMANA' que no estaba pre-definida).
     resp = requests.post(
         _airtable_url(AIRTABLE_REGISTROS_TABLE),
         headers=_airtable_headers(),
-        json={"fields": fields},
+        json={"fields": fields, "typecast": True},
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
     if resp.status_code not in (200, 201):
@@ -611,6 +666,140 @@ def handle_registro_manual_persona(interface, from_num: int, parts: list[str]) -
         log.error("Excepción en REGISTRO_MANUAL_P:\n%s", traceback.format_exc())
 
 
+# ---------- Handlers de fin de semana ----------
+
+
+def handle_consulta_findesemana(interface, from_num: int, parts: list[str]) -> None:
+    """CONSULTA_F|<requestId>|<cedula>.
+
+    Busca en tabla FinDeSemana. Si CC existe → APROBADO con nombre y área.
+    Si no → NO_APROBADO. (No usa autorizado/vence — la tabla es strict
+    whitelist por presencia de fila.)
+    """
+    if len(parts) < 3:
+        log.warning("CONSULTA_F formato inválido: %s", parts)
+        return
+    request_id, cedula = parts[1], parts[2]
+    log.info(
+        "🗓️ CONSULTA_F req=%s cedula=%s de %s",
+        request_id, cedula, _node_hex(from_num),
+    )
+
+    try:
+        record = airtable_find_findesemana(cedula)
+        if record is None:
+            send_text(interface, from_num,
+                      f"RESPUESTA_F|{request_id}|NO_APROBADO")
+            return
+        f = record.get("fields", {})
+        nombre = _truncate(f.get("nombre", ""), 40)
+        area = _truncate(f.get("area", ""), 30)
+        send_text(
+            interface, from_num,
+            f"RESPUESTA_F|{request_id}|APROBADO|{nombre}|{area}",
+        )
+    except AirtableError as e:
+        log.error("AirtableError en CONSULTA_F: %s", e)
+        send_text(interface, from_num,
+                  f"RESPUESTA_F|{request_id}|ERROR|{str(e)[:50]}")
+    except Exception:
+        log.error("Excepción en CONSULTA_F:\n%s", traceback.format_exc())
+        send_text(interface, from_num, f"RESPUESTA_F|{request_id}|ERROR|interno")
+
+
+def handle_entrada_findesemana(interface, from_num: int, parts: list[str]) -> None:
+    """ENTRADA_F|<cedula>|<aprobadoPor>."""
+    if len(parts) < 3:
+        log.warning("ENTRADA_F formato inválido: %s", parts)
+        return
+    _, cedula, approved_by = parts[0], parts[1], parts[2]
+    log.info("🗓️ ENTRADA_F cedula=%s aprobadoPor=%s", cedula, approved_by)
+
+    try:
+        record_id = airtable_create_registro(
+            {
+                "tipo": "ENTRADA",
+                "categoria": "FIN_DE_SEMANA",
+                "cedula": cedula,
+                "entry_time": _now_iso(),
+                "approved_by": approved_by,
+                "status": "APROBADO",
+                "nodo_origen": _node_hex(from_num),
+            }
+        )
+        log.info("✓ Entrada fin-de-semana creada (record %s)", record_id)
+    except AirtableError as e:
+        log.error("AirtableError en ENTRADA_F: %s", e)
+    except Exception:
+        log.error("Excepción en ENTRADA_F:\n%s", traceback.format_exc())
+
+
+def handle_salida_findesemana(interface, from_num: int, parts: list[str]) -> None:
+    """SALIDA_F|<cedula>."""
+    if len(parts) < 2:
+        log.warning("SALIDA_F formato inválido: %s", parts)
+        return
+    cedula = parts[1]
+    log.info("🚪 SALIDA_F cedula=%s", cedula)
+
+    try:
+        record = airtable_find_active_findesemana(cedula)
+        if record is None:
+            log.warning("No hay entrada fin-de-semana activa para CC %s.", cedula)
+            airtable_create_registro(
+                {
+                    "tipo": "SALIDA",
+                    "categoria": "FIN_DE_SEMANA",
+                    "cedula": cedula,
+                    "exit_time": _now_iso(),
+                    "nodo_origen": _node_hex(from_num),
+                    "status": "SALIDA_SIN_ENTRADA",
+                }
+            )
+            return
+        airtable_update_registro(record["id"], {"exit_time": _now_iso()})
+        log.info("✓ Salida fin-de-semana actualizada (record %s)", record["id"])
+    except AirtableError as e:
+        log.error("AirtableError en SALIDA_F: %s", e)
+    except Exception:
+        log.error("Excepción en SALIDA_F:\n%s", traceback.format_exc())
+
+
+def handle_registro_manual_findesemana(interface, from_num: int, parts: list[str]) -> None:
+    """REGISTRO_MANUAL_F|<status>|<cedula>|<supervisor>|<comment>."""
+    if len(parts) < 5:
+        log.warning("REGISTRO_MANUAL_F formato inválido: %s", parts)
+        return
+    status, cedula, supervisor = parts[1], parts[2], parts[3]
+    comment = parts[4] if len(parts) > 4 else ""
+    log.info(
+        "🗓️ REGISTRO_MANUAL_F cedula=%s status=%s supervisor=%s",
+        cedula, status, supervisor,
+    )
+
+    try:
+        fields = {
+            "tipo": "ENTRADA" if status == "APROBADO" else "MANUAL",
+            "categoria": "FIN_DE_SEMANA",
+            "cedula": cedula,
+            "approved_by": supervisor,
+            "status": status,
+            "supervisor": supervisor,
+            "comment": comment,
+            "nodo_origen": _node_hex(from_num),
+        }
+        if status == "APROBADO":
+            fields["entry_time"] = _now_iso()
+        else:
+            fields["rejected_time"] = _now_iso()
+        record_id = airtable_create_registro(fields)
+        log.info("✓ Registro manual fin-de-semana creado (record %s)", record_id)
+    except AirtableError as e:
+        log.error("AirtableError en REGISTRO_MANUAL_F: %s", e)
+    except Exception:
+        log.error("Excepción en REGISTRO_MANUAL_F:\n%s", traceback.format_exc())
+
+
 # ---------- Handlers de items (órdenes de salida) ----------
 
 
@@ -819,6 +1008,10 @@ HANDLERS = {
     "LISTAR_ITEMS": handle_listar_items,
     "CONSULTA_ITEM": handle_consulta_item,
     "SALIDA_ITEM": handle_salida_item,
+    "CONSULTA_F": handle_consulta_findesemana,
+    "ENTRADA_F": handle_entrada_findesemana,
+    "SALIDA_F": handle_salida_findesemana,
+    "REGISTRO_MANUAL_F": handle_registro_manual_findesemana,
 }
 
 

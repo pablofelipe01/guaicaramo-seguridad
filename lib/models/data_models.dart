@@ -383,12 +383,17 @@ class VehicleResponse {
 // ============================================================================
 
 /// Persona que entró a pie (sin vehículo). Paralelo a [VehicleEntry].
+/// Sirve tanto para peatones regulares como para fin-de-semana
+/// (diferenciados por [categoria]).
 class PersonEntry {
   final String cedula;
   final String nombre;
   final DateTime entryTime;
   DateTime? exitTime;
   final String approvedBy;
+  /// "PEATON" o "FIN_DE_SEMANA". Default "PEATON" para compatibilidad
+  /// con entries persistidos antes de añadir este campo.
+  final String categoria;
 
   PersonEntry({
     required this.cedula,
@@ -396,6 +401,7 @@ class PersonEntry {
     required this.entryTime,
     required this.approvedBy,
     this.exitTime,
+    this.categoria = 'PEATON',
   });
 
   bool get hasExited => exitTime != null;
@@ -419,6 +425,7 @@ class PersonEntry {
         'entryTime': entryTime.toIso8601String(),
         'exitTime': exitTime?.toIso8601String(),
         'approvedBy': approvedBy,
+        'categoria': categoria,
       };
 
   factory PersonEntry.fromJson(Map<String, dynamic> json) {
@@ -427,6 +434,7 @@ class PersonEntry {
       nombre: json['nombre'] as String? ?? '',
       entryTime: DateTime.parse(json['entryTime'] as String),
       approvedBy: json['approvedBy'] as String? ?? 'GATEWAY',
+      categoria: json['categoria'] as String? ?? 'PEATON',
     );
     if (json['exitTime'] != null) {
       v.exitTime = DateTime.parse(json['exitTime'] as String);
@@ -503,14 +511,17 @@ class PersonRequest {
 
 /// Resultado de [MeshtasticService.checkPersonWithGateway].
 /// Paralelo a [PlateCheckResult] pero con el nombre del titular.
+/// También se usa para fin-de-semana, con [area] adicional.
 class PersonCheckResult {
   final PlateCheckStatus status;
   final String? personName;
+  final String? area;
   final String? note;
 
   PersonCheckResult({
     required this.status,
     this.personName,
+    this.area,
     this.note,
   });
 

@@ -1074,6 +1074,148 @@ class MeshtasticService extends ChangeNotifier {
     return completer.future;
   }
 
+  // ---------- Fin de Semana (paralelo a peatones, tabla aparte) ----------
+
+  /// Consulta al gateway si una persona está en la lista de FinDeSemana.
+  /// Envía `CONSULTA_F|<requestId>|<cedula>` y espera `RESPUESTA_F|...`.
+  /// Reusa [PersonCheckResult] — el nombre y area vienen en la respuesta.
+  Future<PersonCheckResult> checkFinDeSWithGateway({
+    required String cedula,
+    Duration timeout = const Duration(seconds: 30),
+  }) async {
+    if (!isConnected || _client == null) {
+      return PersonCheckResult(
+        status: PlateCheckStatus.error,
+        note: 'Sin conexión al nodo',
+      );
+    }
+
+    final requestId = _newRequestId();
+    final completer = Completer<PersonCheckResult>();
+    _pendingPersonChecks[requestId] = completer;
+
+    final message = 'CONSULTA_F|$requestId|$cedula';
+    debugPrint('🗓️ [FINDES] CONSULTA_F → gateway: $message');
+    final sent =
+        await sendChatMessage(message, destinationId: currentGatewayNodeId);
+
+    if (!sent) {
+      _pendingPersonChecks.remove(requestId);
+      return PersonCheckResult(
+        status: PlateCheckStatus.error,
+        note: 'No se pudo enviar al gateway',
+      );
+    }
+
+    Future.delayed(timeout, () {
+      final pending = _pendingPersonChecks.remove(requestId);
+      if (pending != null && !pending.isCompleted) {
+        debugPrint('⏰ [FINDES] Timeout consulta $requestId');
+        pending.complete(PersonCheckResult(status: PlateCheckStatus.timeout));
+      }
+    });
+
+    return completer.future;
+  }
+
+  /// `SOLICITUD_F|<cedula>|<comment>` al supervisor.
+  Future<bool> requestFinDeSApproval({
+    required String cedula,
+    required int supervisorNodeId,
+    String? comment,
+  }) async {
+    final safeComment = _sanitizeComment(comment);
+    final message = 'SOLICITUD_F|$cedula|$safeComment';
+    debugPrint(
+      '🗓️ [FINDES] SOLICITUD_F → 0x${supervisorNodeId.toRadixString(16)}: $message',
+    );
+    return sendChatMessage(message, destinationId: supervisorNodeId);
+  }
+
+  /// Supervisor responde a una solicitud fin de semana.
+  /// Envía `<STATUS>_F|<supervisor>|<comment>` al portero.
+  Future<bool> respondToFinDeSRequest({
+    required PersonRequest request,
+    required String status,
+    required String supervisorName,
+    String? comment,
+  }) async {
+    if (!isConnected || _client == null) return false;
+
+    final safeComment = _sanitizeComment(comment);
+    final body = safeComment.isNotEmpty
+        ? '${status}_F|$supervisorName|$safeComment'
+        : '${status}_F|$supervisorName';
+
+    debugPrint(
+      '🗓️ [FINDES] ${status}_F → 0x${request.fromNodeId.toRadixString(16)}: $body',
+    );
+    final sent = await sendChatMessage(body, destinationId: request.fromNodeId);
+    if (!sent) return false;
+
+    for (final r in _personRequests) {
+      if (r.requestId == request.requestId) {
+        r.isResponded = true;
+        r.responseStatus = status;
+        r.supervisorName = supervisorName;
+        r.comment = safeComment.isNotEmpty ? safeComment : null;
+        break;
+      }
+    }
+    await _savePersonRequests();
+    notifyListeners();
+    return true;
+  }
+
+  void addFinDeSEntry({
+    required String cedula,
+    required String nombre,
+    required String approvedBy,
+  }) {
+    _personEntries.add(PersonEntry(
+      cedula: cedula,
+      nombre: nombre,
+      entryTime: DateTime.now(),
+      approvedBy: approvedBy,
+      categoria: 'FIN_DE_SEMANA',
+    ));
+    debugPrint('🗓️ [FINDES] Entrada: $nombre ($cedula)');
+    _savePersonEntries();
+    notifyListeners();
+  }
+
+  /// `ENTRADA_F|<cedula>|<aprobadoPor>` al gateway.
+  Future<bool> sendFinDeSEntryToGateway({
+    required String cedula,
+    required String approvedBy,
+  }) async {
+    final message = 'ENTRADA_F|$cedula|$approvedBy';
+    debugPrint('🗓️ [FINDES] ENTRADA_F → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
+  /// `SALIDA_F|<cedula>` al gateway.
+  Future<bool> sendFinDeSExitToGateway({required String cedula}) async {
+    final message = 'SALIDA_F|$cedula';
+    debugPrint('🗓️ [FINDES] SALIDA_F → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
+  /// `REGISTRO_MANUAL_F|<status>|<cedula>|<supervisor>|<comment>` al gateway.
+  Future<bool> sendRegistroManualFinDeSToGateway({
+    required String status,
+    required String cedula,
+    required String supervisor,
+    String? comment,
+  }) async {
+    final message =
+        'REGISTRO_MANUAL_F|$status|$cedula|$supervisor|${comment ?? ''}';
+    debugPrint('🗓️ [FINDES] REGISTRO_MANUAL_F → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
+  // ---------- Peatones (paralelo a vehículos) ----------
+
   /// `SOLICITUD_P|<cedula>|<comment>` como DM al supervisor.
   /// El comment es opcional pero útil para que el supervisor entienda el contexto.
   Future<bool> requestPersonApproval({
@@ -1324,6 +1466,98 @@ class MeshtasticService extends ChangeNotifier {
       }
 
       // ---------- Protocolo Guaicaramo ----------
+
+      // RESPUESTA_F del gateway a una consulta de fin-de-semana.
+      // Formato: RESPUESTA_F|reqId|APROBADO|nombre|area  o  RESPUESTA_F|reqId|NO_APROBADO
+      if (text.startsWith('RESPUESTA_F|')) {
+        final parts = text.split('|');
+        if (parts.length >= 3) {
+          final requestId = parts[1];
+          final statusStr = parts[2];
+          final completer = _pendingPersonChecks.remove(requestId);
+          debugPrint(
+            '🗓️ [FINDES] RESPUESTA_F $requestId → $statusStr',
+          );
+          if (completer != null && !completer.isCompleted) {
+            PersonCheckResult result;
+            switch (statusStr) {
+              case 'APROBADO':
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.approved,
+                  personName: parts.length > 3 ? parts[3] : null,
+                  area: parts.length > 4 ? parts[4] : null,
+                );
+                break;
+              case 'NO_APROBADO':
+                result =
+                    PersonCheckResult(status: PlateCheckStatus.notApproved);
+                break;
+              case 'ERROR':
+              default:
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.error,
+                  note: parts.length > 3 ? parts[3] : null,
+                );
+                break;
+            }
+            completer.complete(result);
+          }
+        }
+        _markPacketProcessed(packetId);
+        return;
+      }
+
+      // SOLICITUD_F — supervisor recibe pedido fin-de-semana.
+      if (text.startsWith('SOLICITUD_F|')) {
+        final parts = text.split('|');
+        if (parts.length >= 2) {
+          final porteroComment =
+              parts.length >= 3 && parts[2].isNotEmpty ? parts[2] : null;
+          final request = PersonRequest(
+            requestId: DateTime.now().millisecondsSinceEpoch,
+            cedula: parts[1],
+            fromNodeId: fromNodeId,
+            fromNodeName: fromName,
+            timestamp: DateTime.now(),
+            porteroComment: porteroComment,
+          );
+          debugPrint(
+            '🗓️ [FINDES] SOLICITUD_F CC ${parts[1]} de $fromName'
+            '${porteroComment != null ? " — \"$porteroComment\"" : ""}',
+          );
+          _personRequests.add(request);
+          _personRequestController.add(request);
+          _savePersonRequests();
+          notifyListeners();
+        }
+        _markPacketProcessed(packetId);
+        return;
+      }
+
+      // Respuestas del supervisor para fin-de-semana (sufijo _F).
+      // Chequear ANTES de _P/sin sufijo.
+      if (text.startsWith('APROBADO_F|') ||
+          text.startsWith('NEGADO_F|') ||
+          text.startsWith('PENDIENTE_F|')) {
+        final parts = text.split('|');
+        if (parts.length >= 2) {
+          // Quitar sufijo _F.
+          final rawStatus = parts[0].substring(0, parts[0].length - 2);
+          final response = PersonResponse(
+            status: rawStatus,
+            supervisorName: parts[1],
+            comment: parts.length > 2 ? parts[2] : null,
+            fromNodeId: fromNodeId,
+            timestamp: DateTime.now(),
+          );
+          debugPrint(
+            '🗓️ [FINDES] Respuesta $rawStatus de ${parts[1]}',
+          );
+          _personResponseController.add(response);
+        }
+        _markPacketProcessed(packetId);
+        return;
+      }
 
       // RESPUESTA_P del gateway a una consulta de peatón.
       // Debe chequearse ANTES de RESPUESTA| (prefijos comparten texto).
