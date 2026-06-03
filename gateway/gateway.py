@@ -165,6 +165,19 @@ def _is_expired(vence: str) -> bool:
         return False
 
 
+def _registro_vigente(fields: dict[str, Any]) -> bool:
+    """True si la fila de Placas/Personas daría APROBADO en una consulta:
+    `autorizado` marcado y no vencida. Misma lógica que handle_consulta /
+    handle_consulta_persona — se usa para decidir si una SOLICITUD debe
+    reabrir la fila (no vigente) o dejarla quieta (ya vigente, carrera)."""
+    if not bool(fields.get("autorizado")):
+        return False
+    vence = fields.get("vence")
+    if vence and _is_expired(vence):
+        return False
+    return True
+
+
 def airtable_find_placa(placa: str) -> dict[str, Any] | None:
     """Busca una placa exacta (case-insensitive) en la tabla Placas."""
     placa_upper = placa.upper().strip()
@@ -1060,26 +1073,33 @@ def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> Non
 
     try:
         existing = airtable_find_placa(placa)
-        if existing is not None:
-            if bool(existing.get("fields", {}).get("autorizado")):
-                log.info("Placa %s ya autorizada — no se crea solicitud.", placa)
-                return
-            airtable_update_record(
-                AIRTABLE_PLACAS_TABLE, existing["id"], {"estado": "PENDIENTE"}
+        if existing is None:
+            record_id = airtable_create_record(
+                AIRTABLE_PLACAS_TABLE,
+                {
+                    "placa": placa,
+                    "cedula": cedula,
+                    "autorizado": False,
+                    "estado": "PENDIENTE",
+                    "notas": comment,
+                },
             )
-            log.info("✓ Placa %s marcada PENDIENTE (fila existente).", placa)
+            log.info("✓ Solicitud de placa creada PENDIENTE (record %s)", record_id)
             return
-        record_id = airtable_create_record(
-            AIRTABLE_PLACAS_TABLE,
-            {
-                "placa": placa,
-                "cedula": cedula,
-                "autorizado": False,
-                "estado": "PENDIENTE",
-                "notas": comment,
-            },
+        # La fila ya existe → NUNCA duplicar. Reusar la misma fila.
+        f = existing.get("fields", {})
+        estado = (f.get("estado") or "").strip().upper()
+        if _registro_vigente(f):
+            # La consulta habría dado APROBADO (carrera) — nada que hacer.
+            log.info("Placa %s ya vigente — no se crea solicitud.", placa)
+            return
+        if estado == "RECHAZADO":
+            log.info("Placa %s RECHAZADA — no se reabre (requiere admin).", placa)
+            return
+        airtable_update_record(
+            AIRTABLE_PLACAS_TABLE, existing["id"], {"estado": "PENDIENTE"}
         )
-        log.info("✓ Solicitud de placa creada PENDIENTE (record %s)", record_id)
+        log.info("✓ Placa %s marcada PENDIENTE (fila existente).", placa)
     except AirtableError as e:
         log.error("AirtableError en SOLICITUD_V: %s", e)
     except Exception:
@@ -1100,25 +1120,31 @@ def handle_solicitud_persona(interface, from_num: int, parts: list[str]) -> None
 
     try:
         existing = airtable_find_persona(cedula)
-        if existing is not None:
-            if bool(existing.get("fields", {}).get("autorizado")):
-                log.info("Persona %s ya autorizada — no se crea solicitud.", cedula)
-                return
-            airtable_update_record(
-                AIRTABLE_PERSONAS_TABLE, existing["id"], {"estado": "PENDIENTE"}
-            )
-            log.info("✓ Persona %s marcada PENDIENTE (fila existente).", cedula)
+        if existing is None:
+            fields = {
+                "cedula": cedula,
+                "autorizado": False,
+                "estado": "PENDIENTE",
+                "notas": comment,
+            }
+            if nombre:
+                fields["nombre"] = nombre
+            record_id = airtable_create_record(AIRTABLE_PERSONAS_TABLE, fields)
+            log.info("✓ Solicitud de persona creada PENDIENTE (record %s)", record_id)
             return
-        fields = {
-            "cedula": cedula,
-            "autorizado": False,
-            "estado": "PENDIENTE",
-            "notas": comment,
-        }
-        if nombre:
-            fields["nombre"] = nombre
-        record_id = airtable_create_record(AIRTABLE_PERSONAS_TABLE, fields)
-        log.info("✓ Solicitud de persona creada PENDIENTE (record %s)", record_id)
+        # La fila ya existe → NUNCA duplicar. Reusar la misma fila.
+        f = existing.get("fields", {})
+        estado = (f.get("estado") or "").strip().upper()
+        if _registro_vigente(f):
+            log.info("Persona %s ya vigente — no se crea solicitud.", cedula)
+            return
+        if estado == "RECHAZADO":
+            log.info("Persona %s RECHAZADA — no se reabre (requiere admin).", cedula)
+            return
+        airtable_update_record(
+            AIRTABLE_PERSONAS_TABLE, existing["id"], {"estado": "PENDIENTE"}
+        )
+        log.info("✓ Persona %s marcada PENDIENTE (fila existente).", cedula)
     except AirtableError as e:
         log.error("AirtableError en SOLICITUD_P: %s", e)
     except Exception:
@@ -1138,25 +1164,30 @@ def handle_solicitud_findesemana(interface, from_num: int, parts: list[str]) -> 
 
     try:
         existing = airtable_find_findesemana(cedula)
-        if existing is not None:
-            estado = (existing.get("fields", {}).get("estado") or "").strip().upper()
-            if estado in ("", "AUTORIZADO"):
-                log.info("FinDeSemana %s ya vale — no se crea solicitud.", cedula)
-                return
-            airtable_update_record(
-                AIRTABLE_FINDESEMANA_TABLE, existing["id"], {"estado": "PENDIENTE"}
+        if existing is None:
+            record_id = airtable_create_record(
+                AIRTABLE_FINDESEMANA_TABLE,
+                {
+                    "cedula": cedula,
+                    "estado": "PENDIENTE",
+                    "resumen": comment,
+                },
             )
-            log.info("✓ FinDeSemana %s marcada PENDIENTE (fila existente).", cedula)
+            log.info("✓ Solicitud fin-de-semana creada PENDIENTE (record %s)", record_id)
             return
-        record_id = airtable_create_record(
-            AIRTABLE_FINDESEMANA_TABLE,
-            {
-                "cedula": cedula,
-                "estado": "PENDIENTE",
-                "resumen": comment,
-            },
+        # La fila ya existe → NUNCA duplicar. Reusar la misma fila.
+        # En FinDeSemana el "gate" es `estado`: vacío o AUTORIZADO ya vale.
+        estado = (existing.get("fields", {}).get("estado") or "").strip().upper()
+        if estado in ("", "AUTORIZADO"):
+            log.info("FinDeSemana %s ya vale — no se crea solicitud.", cedula)
+            return
+        if estado == "RECHAZADO":
+            log.info("FinDeSemana %s RECHAZADA — no se reabre (requiere admin).", cedula)
+            return
+        airtable_update_record(
+            AIRTABLE_FINDESEMANA_TABLE, existing["id"], {"estado": "PENDIENTE"}
         )
-        log.info("✓ Solicitud fin-de-semana creada PENDIENTE (record %s)", record_id)
+        log.info("✓ FinDeSemana %s marcada PENDIENTE (fila existente).", cedula)
     except AirtableError as e:
         log.error("AirtableError en SOLICITUD_F: %s", e)
     except Exception:
