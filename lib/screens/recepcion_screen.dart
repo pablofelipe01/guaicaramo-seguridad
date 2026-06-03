@@ -15,10 +15,7 @@ enum _RecepcionStage {
   checking,
   approvedByGateway,
   notApproved,
-  waitingSupervisor,
-  approvedBySupervisor,
-  deniedBySupervisor,
-  pendingFromSupervisor,
+  solicitudEnviada,
   error,
 }
 
@@ -43,14 +40,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
 
   PlateCheckResult? _lastPlateCheck;
   PersonCheckResult? _lastPersonCheck;
-  VehicleResponse? _lastVehicleResponse;
-  PersonResponse? _lastPersonResponse;
-  MeshNode? _selectedSupervisor;
   String? _errorMessage;
-
-  StreamSubscription<VehicleResponse>? _vehicleResponseSubscription;
-  StreamSubscription<PersonResponse>? _personResponseSubscription;
-  Timer? _supervisorTimeoutTimer;
 
   MeshtasticService get _service => widget.meshtasticService;
 
@@ -58,18 +48,11 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   void initState() {
     super.initState();
     _service.addListener(_onServiceChange);
-    _vehicleResponseSubscription =
-        _service.vehicleResponseStream.listen(_onSupervisorVehicleResponse);
-    _personResponseSubscription =
-        _service.personResponseStream.listen(_onSupervisorPersonResponse);
   }
 
   @override
   void dispose() {
     _service.removeListener(_onServiceChange);
-    _vehicleResponseSubscription?.cancel();
-    _personResponseSubscription?.cancel();
-    _supervisorTimeoutTimer?.cancel();
     _cedulaController.dispose();
     _placaController.dispose();
     _nombreController.dispose();
@@ -86,16 +69,12 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _stage = _RecepcionStage.idle;
       _lastPlateCheck = null;
       _lastPersonCheck = null;
-      _lastVehicleResponse = null;
-      _lastPersonResponse = null;
-      _selectedSupervisor = null;
       _errorMessage = null;
       _cedulaController.clear();
       _placaController.clear();
       _nombreController.clear();
       _porteroCommentController.clear();
     });
-    _supervisorTimeoutTimer?.cancel();
   }
 
   String get _cedula => _cedulaController.text.trim();
@@ -206,34 +185,32 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     _resetForm();
   }
 
-  Future<void> _requestSupervisorApproval() async {
-    final supervisor = _selectedSupervisor;
-    if (supervisor == null) {
-      _showSnack('Selecciona un supervisor para enviar la solicitud');
+  /// Envía la solicitud al gateway, que crea una fila PENDIENTE en la tabla
+  /// maestra (Placas / Personas / FinDeSemana). Alguien la aprueba luego en
+  /// Airtable y la siguiente consulta normal ya devuelve APROBADO.
+  Future<void> _requestGatewayApproval() async {
+    if (!_service.isConnected) {
+      _showSnack('Sin conexión al nodo Meshtastic');
       return;
     }
-
-    setState(() => _stage = _RecepcionStage.waitingSupervisor);
 
     final comment = _porteroComment.isNotEmpty ? _porteroComment : null;
     bool sent;
     if (_isVehicle) {
-      sent = await _service.requestVehicleApproval(
+      sent = await _service.sendSolicitudVehiculoToGateway(
         cedula: _cedula,
         placa: _placa,
-        supervisorNodeId: supervisor.nodeId,
         comment: comment,
       );
     } else if (_isFinDeSemana) {
-      sent = await _service.requestFinDeSApproval(
+      sent = await _service.sendSolicitudFinDeSToGateway(
         cedula: _cedula,
-        supervisorNodeId: supervisor.nodeId,
         comment: comment,
       );
     } else {
-      sent = await _service.requestPersonApproval(
+      sent = await _service.sendSolicitudPersonaToGateway(
         cedula: _cedula,
-        supervisorNodeId: supervisor.nodeId,
+        nombre: _nombre.isNotEmpty ? _nombre : null,
         comment: comment,
       );
     }
@@ -243,121 +220,12 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     if (!sent) {
       setState(() {
         _stage = _RecepcionStage.error;
-        _errorMessage = 'No se pudo enviar la solicitud al supervisor.';
+        _errorMessage = 'No se pudo enviar la solicitud al gateway.';
       });
       return;
     }
 
-    _supervisorTimeoutTimer?.cancel();
-    _supervisorTimeoutTimer = Timer(const Duration(minutes: 5), () {
-      if (!mounted) return;
-      if (_stage == _RecepcionStage.waitingSupervisor) {
-        setState(() {
-          _stage = _RecepcionStage.error;
-          _errorMessage = 'El supervisor no respondió. Intenta de nuevo.';
-        });
-      }
-    });
-  }
-
-  void _onSupervisorVehicleResponse(VehicleResponse response) {
-    if (!_isVehicle) return;
-    if (_stage != _RecepcionStage.waitingSupervisor) return;
-    _supervisorTimeoutTimer?.cancel();
-    setState(() {
-      _lastVehicleResponse = response;
-      if (response.isApproved) {
-        _stage = _RecepcionStage.approvedBySupervisor;
-      } else if (response.isDenied) {
-        _stage = _RecepcionStage.deniedBySupervisor;
-      } else {
-        _stage = _RecepcionStage.pendingFromSupervisor;
-      }
-    });
-
-    if (response.isApproved) {
-      _service.addVehicleEntry(
-        cedula: _cedula,
-        placa: _placa,
-        approvedBy: response.supervisorName,
-      );
-      _service.sendRegistroManualToGateway(
-        status: 'APROBADO',
-        cedula: _cedula,
-        placa: _placa,
-        supervisor: response.supervisorName,
-        comment: response.comment,
-      );
-    } else if (response.isDenied) {
-      _service.sendRegistroManualToGateway(
-        status: 'NEGADO',
-        cedula: _cedula,
-        placa: _placa,
-        supervisor: response.supervisorName,
-        comment: response.comment,
-      );
-    }
-  }
-
-  void _onSupervisorPersonResponse(PersonResponse response) {
-    if (_isVehicle) return;
-    if (_stage != _RecepcionStage.waitingSupervisor) return;
-    _supervisorTimeoutTimer?.cancel();
-    setState(() {
-      _lastPersonResponse = response;
-      if (response.isApproved) {
-        _stage = _RecepcionStage.approvedBySupervisor;
-      } else if (response.isDenied) {
-        _stage = _RecepcionStage.deniedBySupervisor;
-      } else {
-        _stage = _RecepcionStage.pendingFromSupervisor;
-      }
-    });
-
-    final nombreFallback = _nombre.isNotEmpty ? _nombre : '(sin nombre)';
-    if (response.isApproved) {
-      if (_isFinDeSemana) {
-        _service.addFinDeSEntry(
-          cedula: _cedula,
-          nombre: nombreFallback,
-          approvedBy: response.supervisorName,
-        );
-        _service.sendRegistroManualFinDeSToGateway(
-          status: 'APROBADO',
-          cedula: _cedula,
-          supervisor: response.supervisorName,
-          comment: response.comment,
-        );
-      } else {
-        _service.addPersonEntry(
-          cedula: _cedula,
-          nombre: nombreFallback,
-          approvedBy: response.supervisorName,
-        );
-        _service.sendRegistroManualPersonToGateway(
-          status: 'APROBADO',
-          cedula: _cedula,
-          supervisor: response.supervisorName,
-          comment: response.comment,
-        );
-      }
-    } else if (response.isDenied) {
-      if (_isFinDeSemana) {
-        _service.sendRegistroManualFinDeSToGateway(
-          status: 'NEGADO',
-          cedula: _cedula,
-          supervisor: response.supervisorName,
-          comment: response.comment,
-        );
-      } else {
-        _service.sendRegistroManualPersonToGateway(
-          status: 'NEGADO',
-          cedula: _cedula,
-          supervisor: response.supervisorName,
-          comment: response.comment,
-        );
-      }
-    }
+    setState(() => _stage = _RecepcionStage.solicitudEnviada);
   }
 
   void _showSnack(String message) {
@@ -586,85 +454,14 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       case _RecepcionStage.notApproved:
         return _buildNotApprovedCard();
 
-      case _RecepcionStage.waitingSupervisor:
-        return Card(
-          color: Colors.orange.shade50,
-          elevation: 3,
-          child: Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: Column(
-              children: [
-                const CircularProgressIndicator(),
-                const SizedBox(height: 16),
-                const Text(
-                  'Esperando respuesta del supervisor…',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Solicitud enviada a ${_selectedSupervisor?.displayName ?? "supervisor"}.',
-                  style: const TextStyle(fontSize: 13, color: Colors.grey),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 12),
-                TextButton(
-                  onPressed: _resetForm,
-                  child: const Text('Cancelar'),
-                ),
-              ],
-            ),
-          ),
-        );
-
-      case _RecepcionStage.approvedBySupervisor:
-        final supName = _isVehicle
-            ? _lastVehicleResponse?.supervisorName ?? ''
-            : _lastPersonResponse?.supervisorName ?? '';
-        final comment = _isVehicle
-            ? _lastVehicleResponse?.comment
-            : _lastPersonResponse?.comment;
+      case _RecepcionStage.solicitudEnviada:
         return _ResultCard(
-          icon: Icons.check_circle,
-          color: Colors.green,
-          title: 'APROBADO',
-          subtitle: 'Por: $supName',
-          comment: comment,
-          info: _isVehicle
-              ? 'Vehículo registrado en la lista de abajo.'
-              : 'Persona registrada en la lista de abajo.',
-          onReset: _resetForm,
-        );
-
-      case _RecepcionStage.deniedBySupervisor:
-        final supName = _isVehicle
-            ? _lastVehicleResponse?.supervisorName ?? ''
-            : _lastPersonResponse?.supervisorName ?? '';
-        final comment = _isVehicle
-            ? _lastVehicleResponse?.comment
-            : _lastPersonResponse?.comment;
-        return _ResultCard(
-          icon: Icons.cancel,
-          color: Colors.red,
-          title: 'NEGADO',
-          subtitle: 'Por: $supName',
-          comment: comment,
-          onReset: _resetForm,
-        );
-
-      case _RecepcionStage.pendingFromSupervisor:
-        final supName = _isVehicle
-            ? _lastVehicleResponse?.supervisorName ?? ''
-            : _lastPersonResponse?.supervisorName ?? '';
-        final comment = _isVehicle
-            ? _lastVehicleResponse?.comment
-            : _lastPersonResponse?.comment;
-        return _ResultCard(
-          icon: Icons.pending,
-          color: Colors.orange,
-          title: 'PENDIENTE',
-          subtitle: 'Por: $supName',
-          comment: comment,
-          info: 'El supervisor pidió tiempo. Repite la consulta más tarde.',
+          icon: Icons.mark_email_read,
+          color: Colors.blue,
+          title: 'SOLICITUD ENVIADA',
+          subtitle: 'Esperando aprobación en Airtable.',
+          info: 'Se registró la solicitud. Cuando alguien la apruebe, '
+              'vuelve a consultar y aparecerá como AUTORIZADO.',
           onReset: _resetForm,
         );
 
@@ -690,9 +487,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   }
 
   Widget _buildNotApprovedCard() {
-    final supervisors = _service.onlineNodes
-        .where((n) => n.nodeId != _service.currentGatewayNodeId)
-        .toList();
     final String label;
     if (_isVehicle) {
       label = 'La placa $_placa no está en la lista.';
@@ -727,7 +521,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              '$label Solicita aprobación manual a un supervisor.',
+              '$label Envía la solicitud para aprobación en Airtable.',
               style: const TextStyle(fontSize: 14),
             ),
             const SizedBox(height: 16),
@@ -738,52 +532,18 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
               maxLength: 150,
               textCapitalization: TextCapitalization.sentences,
               decoration: const InputDecoration(
-                labelText: 'Contexto para el supervisor (opcional)',
+                labelText: 'Contexto para quien aprueba (opcional)',
                 hintText: 'Ej: "viene a entregar paquete", '
                     '"es proveedor de la podadora", etc.',
                 border: OutlineInputBorder(),
                 prefixIcon: Icon(Icons.edit_note),
               ),
             ),
-            const SizedBox(height: 8),
-            DropdownButtonFormField<MeshNode>(
-              initialValue: _selectedSupervisor,
-              isExpanded: true,
-              decoration: const InputDecoration(
-                labelText: 'Supervisor destino',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.supervisor_account),
-              ),
-              hint: const Text('Selecciona un supervisor'),
-              items: supervisors
-                  .map((n) => DropdownMenuItem(
-                        value: n,
-                        child: Text(
-                          '${n.displayName} (${n.shortId})',
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ))
-                  .toList(),
-              onChanged: (v) => setState(() => _selectedSupervisor = v),
-            ),
-            if (supervisors.isEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8.0),
-                child: Text(
-                  'No hay supervisores online. Espera a recibir mensajes de otros nodos.',
-                  style: TextStyle(
-                    color: Colors.orange.shade700,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
             const SizedBox(height: 16),
             ElevatedButton.icon(
-              onPressed: _selectedSupervisor == null
-                  ? null
-                  : _requestSupervisorApproval,
+              onPressed: _requestGatewayApproval,
               icon: const Icon(Icons.send),
-              label: const Text('Solicitar Aprobación Manual'),
+              label: const Text('Enviar solicitud de aprobación'),
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.orange,
                 foregroundColor: Colors.white,
@@ -1013,7 +773,6 @@ class _ResultCard extends StatelessWidget {
   final Color color;
   final String title;
   final String subtitle;
-  final String? comment;
   final String? info;
   final Widget? primaryButton;
   final VoidCallback onReset;
@@ -1023,7 +782,6 @@ class _ResultCard extends StatelessWidget {
     required this.color,
     required this.title,
     required this.subtitle,
-    this.comment,
     this.info,
     this.primaryButton,
     required this.onReset,
@@ -1054,28 +812,6 @@ class _ResultCard extends StatelessWidget {
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
               textAlign: TextAlign.center,
             ),
-            if (comment != null && comment!.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Colors.white70,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Row(
-                  children: [
-                    const Icon(Icons.comment, size: 18, color: Colors.grey),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        comment!,
-                        style: const TextStyle(fontSize: 14),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
             if (info != null) ...[
               const SizedBox(height: 8),
               Text(

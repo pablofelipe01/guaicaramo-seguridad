@@ -1031,6 +1031,48 @@ class MeshtasticService extends ChangeNotifier {
     return sendChatMessage(message, destinationId: currentGatewayNodeId);
   }
 
+  // ---------- Solicitudes de aprobación al gateway (visitante no registrado) ----------
+  //
+  // En vez de pedir aprobación a un nodo supervisor, el portero envía la
+  // solicitud al gateway, que crea una fila PENDIENTE en la tabla maestra
+  // (Placas / Personas / FinDeSemana). Alguien la aprueba luego en Airtable.
+
+  /// `SOLICITUD_V|<cedula>|<placa>|<comment>` al gateway → fila PENDIENTE en Placas.
+  Future<bool> sendSolicitudVehiculoToGateway({
+    required String cedula,
+    required String placa,
+    String? comment,
+  }) async {
+    final safeComment = _sanitizeComment(comment);
+    final message = 'SOLICITUD_V|$cedula|$placa|$safeComment';
+    debugPrint('🚗 [VEHICLE] SOLICITUD_V → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
+  /// `SOLICITUD_P|<cedula>|<nombre>|<comment>` al gateway → fila PENDIENTE en Personas.
+  Future<bool> sendSolicitudPersonaToGateway({
+    required String cedula,
+    String? nombre,
+    String? comment,
+  }) async {
+    final safeNombre = _sanitizeShort(nombre ?? '');
+    final safeComment = _sanitizeComment(comment);
+    final message = 'SOLICITUD_P|$cedula|$safeNombre|$safeComment';
+    debugPrint('🚶 [PERSON] SOLICITUD_P → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
+  /// `SOLICITUD_F|<cedula>|<comment>` al gateway → fila PENDIENTE en FinDeSemana.
+  Future<bool> sendSolicitudFinDeSToGateway({
+    required String cedula,
+    String? comment,
+  }) async {
+    final safeComment = _sanitizeComment(comment);
+    final message = 'SOLICITUD_F|$cedula|$safeComment';
+    debugPrint('🗓️ [FINDES] SOLICITUD_F → gateway: $message');
+    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+  }
+
   // ---------- Peatones (paralelo a vehículos) ----------
 
   /// Consulta al gateway si una persona está autorizada.
