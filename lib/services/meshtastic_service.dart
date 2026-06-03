@@ -140,6 +140,8 @@ class MeshtasticService extends ChangeNotifier {
   // ignore: unused_field
   final Map<String, Completer<PlateCheckResult>> _pendingPlateChecks = {};
   final Map<String, Completer<PersonCheckResult>> _pendingPersonChecks = {};
+  // Solicitudes de aprobación en vuelo — requestId -> Completer<SolicitudResult>.
+  final Map<String, Completer<SolicitudResult>> _pendingSolicitudes = {};
 
   /// Contador secuencial para garantizar requestIds únicos cuando se disparan
   /// múltiples consultas en el mismo milisegundo (driver + acompañantes en
@@ -1034,43 +1036,81 @@ class MeshtasticService extends ChangeNotifier {
   // ---------- Solicitudes de aprobación al gateway (visitante no registrado) ----------
   //
   // En vez de pedir aprobación a un nodo supervisor, el portero envía la
-  // solicitud al gateway, que crea una fila PENDIENTE en la tabla maestra
-  // (Placas / Personas / FinDeSemana). Alguien la aprueba luego en Airtable.
+  // solicitud al gateway, que crea/actualiza una fila PENDIENTE en la tabla
+  // maestra (Placas / Personas / FinDeSemana) y responde `RESP_SOL|<reqId>|...`
+  // con el resultado. Alguien la aprueba luego en Airtable.
 
-  /// `SOLICITUD_V|<cedula>|<placa>|<comment>` al gateway → fila PENDIENTE en Placas.
-  Future<bool> sendSolicitudVehiculoToGateway({
-    required String cedula,
-    required String placa,
-    String? comment,
+  /// Envía una SOLICITUD_* y espera la respuesta `RESP_SOL` del gateway.
+  /// Devuelve [SolicitudResult.timeout] si no llega respuesta en [timeout],
+  /// [SolicitudResult.error] si no se pudo enviar o no hay conexión.
+  Future<SolicitudResult> _sendSolicitud(
+    String message,
+    String requestId, {
+    Duration timeout = const Duration(seconds: 30),
   }) async {
-    final safeComment = _sanitizeComment(comment);
-    final message = 'SOLICITUD_V|$cedula|$placa|$safeComment';
-    debugPrint('🚗 [VEHICLE] SOLICITUD_V → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    if (!isConnected || _client == null) return SolicitudResult.error;
+
+    final completer = Completer<SolicitudResult>();
+    _pendingSolicitudes[requestId] = completer;
+
+    final sent =
+        await sendChatMessage(message, destinationId: currentGatewayNodeId);
+    if (!sent) {
+      _pendingSolicitudes.remove(requestId);
+      return SolicitudResult.error;
+    }
+
+    Future.delayed(timeout, () {
+      final pending = _pendingSolicitudes.remove(requestId);
+      if (pending != null && !pending.isCompleted) {
+        debugPrint('⏰ [SOLICITUD] Timeout $requestId');
+        pending.complete(SolicitudResult.timeout);
+      }
+    });
+
+    return completer.future;
   }
 
-  /// `SOLICITUD_P|<cedula>|<nombre>|<comment>` al gateway → fila PENDIENTE en Personas.
-  Future<bool> sendSolicitudPersonaToGateway({
+  /// `SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>` → fila PENDIENTE en Placas.
+  Future<SolicitudResult> sendSolicitudVehiculoToGateway({
+    required String cedula,
+    required String placa,
+    String? nombre,
+    String? comment,
+  }) async {
+    final requestId = _newRequestId();
+    final safeNombre = _sanitizeShort(nombre ?? '');
+    final safeComment = _sanitizeComment(comment);
+    final message =
+        'SOLICITUD_V|$requestId|$cedula|$placa|$safeNombre|$safeComment';
+    debugPrint('🚗 [VEHICLE] SOLICITUD_V → gateway: $message');
+    return _sendSolicitud(message, requestId);
+  }
+
+  /// `SOLICITUD_P|<reqId>|<cedula>|<nombre>|<comment>` → fila PENDIENTE en Personas.
+  Future<SolicitudResult> sendSolicitudPersonaToGateway({
     required String cedula,
     String? nombre,
     String? comment,
   }) async {
+    final requestId = _newRequestId();
     final safeNombre = _sanitizeShort(nombre ?? '');
     final safeComment = _sanitizeComment(comment);
-    final message = 'SOLICITUD_P|$cedula|$safeNombre|$safeComment';
+    final message = 'SOLICITUD_P|$requestId|$cedula|$safeNombre|$safeComment';
     debugPrint('🚶 [PERSON] SOLICITUD_P → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendSolicitud(message, requestId);
   }
 
-  /// `SOLICITUD_F|<cedula>|<comment>` al gateway → fila PENDIENTE en FinDeSemana.
-  Future<bool> sendSolicitudFinDeSToGateway({
+  /// `SOLICITUD_F|<reqId>|<cedula>|<comment>` → fila PENDIENTE en FinDeSemana.
+  Future<SolicitudResult> sendSolicitudFinDeSToGateway({
     required String cedula,
     String? comment,
   }) async {
+    final requestId = _newRequestId();
     final safeComment = _sanitizeComment(comment);
-    final message = 'SOLICITUD_F|$cedula|$safeComment';
+    final message = 'SOLICITUD_F|$requestId|$cedula|$safeComment';
     debugPrint('🗓️ [FINDES] SOLICITUD_F → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendSolicitud(message, requestId);
   }
 
   // ---------- Peatones (paralelo a vehículos) ----------
@@ -1711,6 +1751,41 @@ class MeshtasticService extends ChangeNotifier {
       // SALIDA_ITEM_OK|numero
       if (text.startsWith('SALIDA_ITEM_OK|')) {
         _handleSalidaItemOk(text.split('|'));
+        _markPacketProcessed(packetId);
+        return;
+      }
+
+      // RESP_SOL — resultado del gateway a una SOLICITUD_* (visitante no
+      // registrado). Formato: RESP_SOL|<reqId>|<REGISTRADA|RECHAZADA|YA_VIGENTE|ERROR>
+      if (text.startsWith('RESP_SOL|')) {
+        final parts = text.split('|');
+        if (parts.length >= 3) {
+          final requestId = parts[1];
+          final resultStr = parts[2];
+          final completer = _pendingSolicitudes.remove(requestId);
+          debugPrint(
+            '📨 [SOLICITUD] RESP_SOL $requestId → $resultStr (pendiente: ${completer != null})',
+          );
+          if (completer != null && !completer.isCompleted) {
+            SolicitudResult result;
+            switch (resultStr) {
+              case 'REGISTRADA':
+                result = SolicitudResult.registrada;
+                break;
+              case 'RECHAZADA':
+                result = SolicitudResult.rechazada;
+                break;
+              case 'YA_VIGENTE':
+                result = SolicitudResult.yaVigente;
+                break;
+              case 'ERROR':
+              default:
+                result = SolicitudResult.error;
+                break;
+            }
+            completer.complete(result);
+          }
+        }
         _markPacketProcessed(packetId);
         return;
       }

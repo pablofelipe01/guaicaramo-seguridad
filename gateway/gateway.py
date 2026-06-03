@@ -20,12 +20,15 @@ Escucha mensajes en la red mesh y los traduce a operaciones en Airtable:
       → inserta fila en `Registros` con la aprobación manual (status puede ser
         APROBADO, NEGADO o PENDIENTE).
 
-  SOLICITUD_V|<cedula>|<placa>|<comment>
-  SOLICITUD_P|<cedula>|<nombre>|<comment>
-  SOLICITUD_F|<cedula>|<comment>
-      → visitante NO registrado: crea una fila PENDIENTE en la tabla maestra
-        (Placas / Personas / FinDeSemana) sin autorizar. Alguien la aprueba
-        luego en Airtable y la siguiente consulta ya devuelve APROBADO.
+  SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>
+  SOLICITUD_P|<reqId>|<cedula>|<nombre>|<comment>
+  SOLICITUD_F|<reqId>|<cedula>|<comment>
+      → visitante NO registrado: crea/actualiza una fila PENDIENTE en la tabla
+        maestra (Placas / Personas / FinDeSemana) sin autorizar, guardando el
+        nombre. Nunca duplica (reusa la fila si ya existe). Responde
+        RESP_SOL|<reqId>|<REGISTRADA|RECHAZADA|YA_VIGENTE|ERROR>.
+        Alguien la aprueba luego en Airtable y la siguiente consulta ya
+        devuelve APROBADO.
 
 El gateway sólo procesa mensajes que llegan como DM (destino == este nodo).
 
@@ -1058,64 +1061,83 @@ def handle_salida_item(interface, from_num: int, parts: list[str]) -> None:
 # (marca autorizado / estado=AUTORIZADO) y la siguiente consulta ya da APROBADO.
 
 
+def _send_resp_sol(interface, from_num: int, request_id: str, resultado: str) -> None:
+    """Responde al portero el resultado de una SOLICITUD_*.
+    resultado ∈ {REGISTRADA, RECHAZADA, YA_VIGENTE, ERROR}."""
+    send_text(interface, from_num, f"RESP_SOL|{request_id}|{resultado}")
+
+
 def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> None:
-    """SOLICITUD_V|<cedula>|<placa>|<comment>. Crea fila PENDIENTE en Placas."""
-    if len(parts) < 3:
+    """SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>.
+    Crea/actualiza fila PENDIENTE en Placas (guardando conductor) y responde
+    RESP_SOL con el resultado."""
+    if len(parts) < 4:
         log.warning("SOLICITUD_V formato inválido: %s", parts)
         return
-    cedula = parts[1].strip()
-    placa = parts[2].upper().strip()
-    comment = parts[3] if len(parts) > 3 else ""
+    request_id = parts[1]
+    cedula = parts[2].strip()
+    placa = parts[3].upper().strip()
+    nombre = parts[4].strip() if len(parts) > 4 else ""
+    comment = parts[5] if len(parts) > 5 else ""
     log.info(
-        "🚗 SOLICITUD_V placa=%s cedula=%s de %s",
-        placa, cedula, _node_hex(from_num),
+        "🚗 SOLICITUD_V req=%s placa=%s cedula=%s conductor=%s de %s",
+        request_id, placa, cedula, nombre or "—", _node_hex(from_num),
     )
 
     try:
         existing = airtable_find_placa(placa)
         if existing is None:
-            record_id = airtable_create_record(
-                AIRTABLE_PLACAS_TABLE,
-                {
-                    "placa": placa,
-                    "cedula": cedula,
-                    "autorizado": False,
-                    "estado": "PENDIENTE",
-                    "notas": comment,
-                },
-            )
+            fields = {
+                "placa": placa,
+                "cedula": cedula,
+                "autorizado": False,
+                "estado": "PENDIENTE",
+                "notas": comment,
+            }
+            if nombre:
+                fields["conductor"] = nombre
+            record_id = airtable_create_record(AIRTABLE_PLACAS_TABLE, fields)
             log.info("✓ Solicitud de placa creada PENDIENTE (record %s)", record_id)
+            _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
             return
         # La fila ya existe → NUNCA duplicar. Reusar la misma fila.
         f = existing.get("fields", {})
         estado = (f.get("estado") or "").strip().upper()
         if _registro_vigente(f):
-            # La consulta habría dado APROBADO (carrera) — nada que hacer.
             log.info("Placa %s ya vigente — no se crea solicitud.", placa)
+            _send_resp_sol(interface, from_num, request_id, "YA_VIGENTE")
             return
         if estado == "RECHAZADO":
             log.info("Placa %s RECHAZADA — no se reabre (requiere admin).", placa)
+            _send_resp_sol(interface, from_num, request_id, "RECHAZADA")
             return
-        airtable_update_record(
-            AIRTABLE_PLACAS_TABLE, existing["id"], {"estado": "PENDIENTE"}
-        )
+        update = {"estado": "PENDIENTE"}
+        if nombre and not (f.get("conductor") or "").strip():
+            update["conductor"] = nombre
+        airtable_update_record(AIRTABLE_PLACAS_TABLE, existing["id"], update)
         log.info("✓ Placa %s marcada PENDIENTE (fila existente).", placa)
+        _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
     except AirtableError as e:
         log.error("AirtableError en SOLICITUD_V: %s", e)
+        _send_resp_sol(interface, from_num, request_id, "ERROR")
     except Exception:
         log.error("Excepción en SOLICITUD_V:\n%s", traceback.format_exc())
+        _send_resp_sol(interface, from_num, request_id, "ERROR")
 
 
 def handle_solicitud_persona(interface, from_num: int, parts: list[str]) -> None:
-    """SOLICITUD_P|<cedula>|<nombre>|<comment>. Crea fila PENDIENTE en Personas."""
-    if len(parts) < 2:
+    """SOLICITUD_P|<reqId>|<cedula>|<nombre>|<comment>.
+    Crea/actualiza fila PENDIENTE en Personas y responde RESP_SOL."""
+    if len(parts) < 3:
         log.warning("SOLICITUD_P formato inválido: %s", parts)
         return
-    cedula = parts[1].strip()
-    nombre = parts[2].strip() if len(parts) > 2 else ""
-    comment = parts[3] if len(parts) > 3 else ""
+    request_id = parts[1]
+    cedula = parts[2].strip()
+    nombre = parts[3].strip() if len(parts) > 3 else ""
+    comment = parts[4] if len(parts) > 4 else ""
     log.info(
-        "🚶 SOLICITUD_P cedula=%s de %s", cedula, _node_hex(from_num),
+        "🚶 SOLICITUD_P req=%s cedula=%s nombre=%s de %s",
+        request_id, cedula, nombre or "—", _node_hex(from_num),
     )
 
     try:
@@ -1131,35 +1153,45 @@ def handle_solicitud_persona(interface, from_num: int, parts: list[str]) -> None
                 fields["nombre"] = nombre
             record_id = airtable_create_record(AIRTABLE_PERSONAS_TABLE, fields)
             log.info("✓ Solicitud de persona creada PENDIENTE (record %s)", record_id)
+            _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
             return
         # La fila ya existe → NUNCA duplicar. Reusar la misma fila.
         f = existing.get("fields", {})
         estado = (f.get("estado") or "").strip().upper()
         if _registro_vigente(f):
             log.info("Persona %s ya vigente — no se crea solicitud.", cedula)
+            _send_resp_sol(interface, from_num, request_id, "YA_VIGENTE")
             return
         if estado == "RECHAZADO":
             log.info("Persona %s RECHAZADA — no se reabre (requiere admin).", cedula)
+            _send_resp_sol(interface, from_num, request_id, "RECHAZADA")
             return
-        airtable_update_record(
-            AIRTABLE_PERSONAS_TABLE, existing["id"], {"estado": "PENDIENTE"}
-        )
+        update = {"estado": "PENDIENTE"}
+        if nombre and not (f.get("nombre") or "").strip():
+            update["nombre"] = nombre
+        airtable_update_record(AIRTABLE_PERSONAS_TABLE, existing["id"], update)
         log.info("✓ Persona %s marcada PENDIENTE (fila existente).", cedula)
+        _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
     except AirtableError as e:
         log.error("AirtableError en SOLICITUD_P: %s", e)
+        _send_resp_sol(interface, from_num, request_id, "ERROR")
     except Exception:
         log.error("Excepción en SOLICITUD_P:\n%s", traceback.format_exc())
+        _send_resp_sol(interface, from_num, request_id, "ERROR")
 
 
 def handle_solicitud_findesemana(interface, from_num: int, parts: list[str]) -> None:
-    """SOLICITUD_F|<cedula>|<comment>. Crea fila PENDIENTE en FinDeSemana."""
-    if len(parts) < 2:
+    """SOLICITUD_F|<reqId>|<cedula>|<comment>.
+    Crea/actualiza fila PENDIENTE en FinDeSemana y responde RESP_SOL."""
+    if len(parts) < 3:
         log.warning("SOLICITUD_F formato inválido: %s", parts)
         return
-    cedula = parts[1].strip()
-    comment = parts[2] if len(parts) > 2 else ""
+    request_id = parts[1]
+    cedula = parts[2].strip()
+    comment = parts[3] if len(parts) > 3 else ""
     log.info(
-        "🗓️ SOLICITUD_F cedula=%s de %s", cedula, _node_hex(from_num),
+        "🗓️ SOLICITUD_F req=%s cedula=%s de %s",
+        request_id, cedula, _node_hex(from_num),
     )
 
     try:
@@ -1174,24 +1206,30 @@ def handle_solicitud_findesemana(interface, from_num: int, parts: list[str]) -> 
                 },
             )
             log.info("✓ Solicitud fin-de-semana creada PENDIENTE (record %s)", record_id)
+            _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
             return
         # La fila ya existe → NUNCA duplicar. Reusar la misma fila.
         # En FinDeSemana el "gate" es `estado`: vacío o AUTORIZADO ya vale.
         estado = (existing.get("fields", {}).get("estado") or "").strip().upper()
         if estado in ("", "AUTORIZADO"):
             log.info("FinDeSemana %s ya vale — no se crea solicitud.", cedula)
+            _send_resp_sol(interface, from_num, request_id, "YA_VIGENTE")
             return
         if estado == "RECHAZADO":
             log.info("FinDeSemana %s RECHAZADA — no se reabre (requiere admin).", cedula)
+            _send_resp_sol(interface, from_num, request_id, "RECHAZADA")
             return
         airtable_update_record(
             AIRTABLE_FINDESEMANA_TABLE, existing["id"], {"estado": "PENDIENTE"}
         )
         log.info("✓ FinDeSemana %s marcada PENDIENTE (fila existente).", cedula)
+        _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
     except AirtableError as e:
         log.error("AirtableError en SOLICITUD_F: %s", e)
+        _send_resp_sol(interface, from_num, request_id, "ERROR")
     except Exception:
         log.error("Excepción en SOLICITUD_F:\n%s", traceback.format_exc())
+        _send_resp_sol(interface, from_num, request_id, "ERROR")
 
 
 # Mapa prefijo → handler. on_receive hace exact match con dict.get(prefix),

@@ -15,7 +15,10 @@ enum _RecepcionStage {
   checking,
   approvedByGateway,
   notApproved,
+  sendingSolicitud,
   solicitudEnviada,
+  solicitudRechazada,
+  solicitudYaVigente,
   error,
 }
 
@@ -185,30 +188,37 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     _resetForm();
   }
 
-  /// Envía la solicitud al gateway, que crea una fila PENDIENTE en la tabla
-  /// maestra (Placas / Personas / FinDeSemana). Alguien la aprueba luego en
-  /// Airtable y la siguiente consulta normal ya devuelve APROBADO.
+  /// Envía la solicitud al gateway, que crea/actualiza una fila PENDIENTE en la
+  /// tabla maestra y responde el resultado. Muestra ese resultado al portero.
   Future<void> _requestGatewayApproval() async {
     if (!_service.isConnected) {
       _showSnack('Sin conexión al nodo Meshtastic');
       return;
     }
+    // En vehículo el nombre del conductor es obligatorio para la solicitud.
+    if (_isVehicle && _nombre.isEmpty) {
+      _showSnack('Ingresa el nombre del conductor');
+      return;
+    }
+
+    setState(() => _stage = _RecepcionStage.sendingSolicitud);
 
     final comment = _porteroComment.isNotEmpty ? _porteroComment : null;
-    bool sent;
+    SolicitudResult result;
     if (_isVehicle) {
-      sent = await _service.sendSolicitudVehiculoToGateway(
+      result = await _service.sendSolicitudVehiculoToGateway(
         cedula: _cedula,
         placa: _placa,
+        nombre: _nombre,
         comment: comment,
       );
     } else if (_isFinDeSemana) {
-      sent = await _service.sendSolicitudFinDeSToGateway(
+      result = await _service.sendSolicitudFinDeSToGateway(
         cedula: _cedula,
         comment: comment,
       );
     } else {
-      sent = await _service.sendSolicitudPersonaToGateway(
+      result = await _service.sendSolicitudPersonaToGateway(
         cedula: _cedula,
         nombre: _nombre.isNotEmpty ? _nombre : null,
         comment: comment,
@@ -217,15 +227,28 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
 
     if (!mounted) return;
 
-    if (!sent) {
-      setState(() {
-        _stage = _RecepcionStage.error;
-        _errorMessage = 'No se pudo enviar la solicitud al gateway.';
-      });
-      return;
-    }
-
-    setState(() => _stage = _RecepcionStage.solicitudEnviada);
+    setState(() {
+      switch (result) {
+        case SolicitudResult.registrada:
+          _stage = _RecepcionStage.solicitudEnviada;
+          break;
+        case SolicitudResult.rechazada:
+          _stage = _RecepcionStage.solicitudRechazada;
+          break;
+        case SolicitudResult.yaVigente:
+          _stage = _RecepcionStage.solicitudYaVigente;
+          break;
+        case SolicitudResult.timeout:
+          _stage = _RecepcionStage.error;
+          _errorMessage =
+              'El gateway no respondió a tiempo. Verifica la conexión LoRa.';
+          break;
+        case SolicitudResult.error:
+          _stage = _RecepcionStage.error;
+          _errorMessage = 'No se pudo registrar la solicitud en el gateway.';
+          break;
+      }
+    });
   }
 
   void _showSnack(String message) {
@@ -454,6 +477,30 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       case _RecepcionStage.notApproved:
         return _buildNotApprovedCard();
 
+      case _RecepcionStage.sendingSolicitud:
+        return Card(
+          color: Colors.blue.shade50,
+          elevation: 3,
+          child: const Padding(
+            padding: EdgeInsets.all(24.0),
+            child: Column(
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text(
+                  'Enviando solicitud…',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+                ),
+                SizedBox(height: 4),
+                Text(
+                  'Esperando confirmación del gateway.',
+                  style: TextStyle(fontSize: 13, color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+        );
+
       case _RecepcionStage.solicitudEnviada:
         return _ResultCard(
           icon: Icons.mark_email_read,
@@ -462,6 +509,39 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           subtitle: 'Esperando aprobación en Airtable.',
           info: 'Se registró la solicitud. Cuando alguien la apruebe, '
               'vuelve a consultar y aparecerá como AUTORIZADO.',
+          onReset: _resetForm,
+        );
+
+      case _RecepcionStage.solicitudRechazada:
+        return _ResultCard(
+          icon: Icons.block,
+          color: Colors.red,
+          title: 'RECHAZADA',
+          subtitle: _isVehicle
+              ? 'La placa $_placa fue rechazada.'
+              : 'La cédula $_cedula fue rechazada.',
+          info: 'No se reabre desde la app. Si debe entrar, un administrador '
+              'tiene que habilitarla en Airtable.',
+          onReset: _resetForm,
+        );
+
+      case _RecepcionStage.solicitudYaVigente:
+        return _ResultCard(
+          icon: Icons.check_circle,
+          color: Colors.green,
+          title: 'YA AUTORIZADA',
+          subtitle: 'Esta entrada ya está vigente.',
+          info: 'Vuelve a consultar para registrar el ingreso.',
+          primaryButton: ElevatedButton.icon(
+            onPressed: _verify,
+            icon: const Icon(Icons.refresh),
+            label: const Text('Consultar de nuevo'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 24),
+            ),
+          ),
           onReset: _resetForm,
         );
 
@@ -525,6 +605,21 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
               style: const TextStyle(fontSize: 14),
             ),
             const SizedBox(height: 16),
+            // En vehículo pedimos el nombre del conductor (obligatorio) para
+            // guardarlo en Placas junto con la placa y la cédula.
+            if (_isVehicle) ...[
+              TextField(
+                controller: _nombreController,
+                textCapitalization: TextCapitalization.words,
+                decoration: const InputDecoration(
+                  labelText: 'Nombre del conductor',
+                  hintText: 'Nombre y apellido',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.person),
+                ),
+              ),
+              const SizedBox(height: 12),
+            ],
             TextField(
               controller: _porteroCommentController,
               minLines: 2,

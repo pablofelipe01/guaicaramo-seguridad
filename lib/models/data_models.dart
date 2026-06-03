@@ -339,6 +339,25 @@ class VehicleRequest {
 
 enum PlateCheckStatus { approved, notApproved, timeout, error }
 
+/// Resultado de una SOLICITUD_* al gateway (visitante no registrado).
+/// El gateway responde `RESP_SOL|<reqId>|<resultado>`.
+enum SolicitudResult {
+  /// Fila PENDIENTE creada o actualizada — esperando aprobación en Airtable.
+  registrada,
+
+  /// La placa/cédula está RECHAZADA; no se reabre (lo hace un admin).
+  rechazada,
+
+  /// Ya estaba vigente (daría APROBADO) — el portero debe reconsultar.
+  yaVigente,
+
+  /// Error en el gateway/Airtable.
+  error,
+
+  /// No llegó respuesta del gateway a tiempo.
+  timeout,
+}
+
 /// Resultado de [MeshtasticService.checkPlateWithGateway].
 class PlateCheckResult {
   final PlateCheckStatus status;

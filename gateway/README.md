@@ -12,17 +12,19 @@ operaciones sobre Airtable.
 | `ENTRADA_V\|<cedula>\|<placa>\|<aprobadoPor>`                     | Inserta fila en `Registros` con `tipo=ENTRADA`, `entry_time` actual, `approved_by`.            |
 | `SALIDA_V\|<placa>`                                               | Busca el último `ENTRADA` sin salida para esa placa y le pone `exit_time`.                     |
 | `REGISTRO_MANUAL\|<status>\|<cedula>\|<placa>\|<supervisor>\|<c>` | Inserta fila con la aprobación manual (status = `APROBADO` / `NEGADO` / `PENDIENTE`).          |
-| `SOLICITUD_V\|<cedula>\|<placa>\|<comment>`                       | Visitante no registrado: crea fila `PENDIENTE` en `Placas` (`autorizado=false`, `estado=PENDIENTE`). |
-| `SOLICITUD_P\|<cedula>\|<nombre>\|<comment>`                      | Igual en `Personas` (`autorizado=false`, `estado=PENDIENTE`).                                  |
-| `SOLICITUD_F\|<cedula>\|<comment>`                               | Igual en `FinDeSemana` (`estado=PENDIENTE`).                                                   |
+| `SOLICITUD_V\|<reqId>\|<cedula>\|<placa>\|<nombre>\|<comment>`     | Visitante no registrado: crea/actualiza fila `PENDIENTE` en `Placas` (`autorizado=false`, `estado=PENDIENTE`, `conductor=<nombre>`). Responde `RESP_SOL`. |
+| `SOLICITUD_P\|<reqId>\|<cedula>\|<nombre>\|<comment>`             | Igual en `Personas`. Responde `RESP_SOL`.                                                      |
+| `SOLICITUD_F\|<reqId>\|<cedula>\|<comment>`                       | Igual en `FinDeSemana` (`estado=PENDIENTE`). Responde `RESP_SOL`.                              |
 
+> **Respuesta `RESP_SOL\|<reqId>\|<resultado>`** — resultado ∈ `REGISTRADA` (creada/actualizada a PENDIENTE), `RECHAZADA` (existe y está `RECHAZADO`, no se reabre), `YA_VIGENTE` (ya daría APROBADO; reconsultar), `ERROR`.
+>
 > **Sin duplicados:** la `SOLICITUD_*` busca por placa/cédula antes de crear.
 > Si la fila **ya existe** nunca crea otra: la reusa.
-> - Ya vigente (daría `APROBADO`) → no hace nada (carrera).
-> - `RECHAZADO` → no la reabre (un admin debe hacerlo en Airtable).
-> - Cualquier otro caso (no autorizada, vencida, pendiente) → la pone `PENDIENTE`.
+> - Ya vigente (daría `APROBADO`) → `YA_VIGENTE`, no toca nada.
+> - `RECHAZADO` → `RECHAZADA`, no la reabre (un admin debe hacerlo en Airtable).
+> - Cualquier otro caso (no autorizada, vencida, pendiente) → la pone `PENDIENTE` → `REGISTRADA`.
 >
-> **Aprobación asíncrona:** las `SOLICITUD_*` NO devuelven respuesta. Alguien la aprueba en Airtable (en `Placas`/`Personas` marca `autorizado`; en `FinDeSemana` pone `estado=AUTORIZADO`). La siguiente `CONSULTA` normal ya devuelve `APROBADO`.
+> **Aprobación asíncrona:** quien aprueba en Airtable marca `autorizado` (Placas/Personas) o `estado=AUTORIZADO` (FinDeSemana). La siguiente `CONSULTA` normal ya devuelve `APROBADO`.
 
 ## Esquema Airtable
 
