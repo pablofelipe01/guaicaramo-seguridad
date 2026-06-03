@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'models/data_models.dart';
 import 'services/meshtastic_service.dart';
+import 'services/foreground_connection.dart';
 import 'screens/chat_screen.dart';
 import 'screens/map_screen.dart';
 import 'screens/recepcion_screen.dart';
@@ -13,6 +15,10 @@ import 'screens/salidas_screen.dart';
 import 'screens/settings_screen.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Puerto de comunicación del foreground service (requerido en v9.x).
+  FlutterForegroundTask.initCommunicationPort();
+  ForegroundConnection.initOptions();
   runApp(const GuaicaramoControlApp());
 }
 
@@ -373,12 +379,22 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     _service.clearUnreadChat();
   }
 
+  /// Último estado de conexión sincronizado con la notificación del servicio
+  /// en primer plano (evita llamar al plugin en cada notifyListeners).
+  ConnectionStatus? _lastSyncedStatus;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _service.addListener(_onServiceChange);
-    _connectToDevice();
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    // Permiso de notificación (Android 13+) para poder mostrar la del servicio.
+    await ForegroundConnection.requestPermissions();
+    await _connectToDevice();
   }
 
   @override
@@ -400,6 +416,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
 
   void _onServiceChange() {
     if (mounted) setState(() {});
+    // Arranca/actualiza el servicio en primer plano solo cuando el estado de
+    // conexión cambia (no en cada paquete recibido).
+    if (_service.status != _lastSyncedStatus) {
+      _lastSyncedStatus = _service.status;
+      ForegroundConnection.sync(_service.status);
+    }
   }
 
   Future<void> _connectToDevice() async {
@@ -407,6 +429,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   }
 
   void _navigateToDeviceSelection() {
+    // Al olvidar/cambiar de nodo dejamos de mantener la conexión viva.
+    ForegroundConnection.stop();
+    _lastSyncedStatus = null;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (context) =>
@@ -498,6 +523,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     }
     final shouldExit = await _confirmExit();
     if (shouldExit) {
+      await ForegroundConnection.stop();
       await SystemNavigator.pop();
     }
   }

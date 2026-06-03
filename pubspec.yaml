@@ -1,7 +1,7 @@
 name: guaicaramo_control
 description: "Aplicación de control para la red mesh Meshtastic de Guaicaramo (chat, mapa, recepción de vehículos)."
 publish_to: 'none'
-version: 0.7.1+13
+version: 0.8.0+14
 
 environment:
   sdk: ^3.10.7
@@ -15,6 +15,10 @@ dependencies:
     path: packages/meshtastic_flutter
   shared_preferences: ^2.2.2
   permission_handler: ^12.0.1
+
+  # Servicio en primer plano: mantiene viva la conexión BLE con la pantalla
+  # apagada (evita que Android suspenda la app y mate el Bluetooth).
+  flutter_foreground_task: ^9.1.0
 
   # Mapa offline (Fase 4)
   flutter_map: ^7.0.0

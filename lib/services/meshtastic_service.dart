@@ -642,18 +642,14 @@ class MeshtasticService extends ChangeNotifier {
         onDone: () => debugPrint('⚠️ [PACKET_DONE] packetStream cerrado'),
       );
 
-      await for (final device in _client!.scanForDevices()) {
-        if (device.remoteId.toString() == address) {
-          _connectedDeviceName = device.platformName;
-          _connectedDeviceMac = address;
-          _updateStatus(
-            ConnectionStatus.connecting,
-            'Conectando a ${device.platformName}...',
-          );
-          await _client!.connectToDevice(device);
-          break;
-        }
-      }
+      // Reconexión directa por MAC, sin escanear (mucho más rápido para un
+      // dispositivo ya conocido). El nombre lo tomamos del guardado.
+      _connectedDeviceMac = address;
+      _updateStatus(
+        ConnectionStatus.connecting,
+        'Conectando a ${_connectedDeviceName ?? "nodo"}...',
+      );
+      await _client!.connectById(address);
     } catch (e) {
       _updateStatus(ConnectionStatus.error, 'Error: ${e.toString()}');
     }
@@ -773,14 +769,11 @@ class MeshtasticService extends ChangeNotifier {
           onError: (e) => debugPrint('❌ [PACKET_ERROR] $e'),
         );
 
-        await for (final device in _client!.scanForDevices()) {
-          if (device.remoteId.toString() == savedAddress) {
-            await _client!.connectToDevice(device);
-            debugPrint('✅ [RECONNECT] Reconectado exitosamente');
-            _isReconnecting = false;
-            return;
-          }
-        }
+        // Reconexión directa por MAC, sin escanear (más rápido y fiable).
+        await _client!.connectById(savedAddress);
+        debugPrint('✅ [RECONNECT] Reconectado exitosamente');
+        _isReconnecting = false;
+        return;
       } catch (e) {
         debugPrint('❌ [RECONNECT] Intento $attempt falló: $e');
       }

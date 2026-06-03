@@ -179,6 +179,14 @@ class MeshtasticClient {
     }
   }
 
+  /// Connect directly to a device by its remoteId, without scanning first.
+  /// Useful for fast reconnection to an already-known/bonded device (e.g. on
+  /// app resume or after a drop) — avoids the slow scan cycle.
+  Future<void> connectById(String remoteId) async {
+    final device = BluetoothDevice.fromId(remoteId);
+    await connectToDevice(device);
+  }
+
   /// Connect to a specific Meshtastic device
   Future<void> connectToDevice(BluetoothDevice device) async {
     _logger.info(
