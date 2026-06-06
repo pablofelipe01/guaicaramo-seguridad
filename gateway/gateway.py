@@ -182,11 +182,23 @@ def _registro_vigente(fields: dict[str, Any]) -> bool:
 
 
 def airtable_find_placa(placa: str) -> dict[str, Any] | None:
-    """Busca una placa exacta (case-insensitive) en la tabla Placas."""
+    """Busca una placa exacta (case-insensitive) en la tabla Placas.
+
+    Una misma placa puede tener VARIAS filas (el sistema crea una por
+    autorización/día). Preferimos una fila VIGENTE (autorizado + no vencida);
+    si ninguna está vigente, devolvemos la de mayor `vence` para que el handler
+    reporte el estado real (vencida / no autorizada). Antes se pedía
+    maxRecords=1 sin orden y Airtable podía devolver una fila vencida aunque
+    existiera otra vigente → NO_APROBADO indebido.
+    """
     placa_upper = placa.upper().strip()
     # Airtable formula: UPPER({placa}) = 'XYZ123'
     formula = f"UPPER({{placa}}) = '{placa_upper}'"
-    params = {"filterByFormula": formula, "maxRecords": 1}
+    params = {
+        "filterByFormula": formula,
+        "sort[0][field]": "vence",
+        "sort[0][direction]": "desc",
+    }
     resp = requests.get(
         _airtable_url(AIRTABLE_PLACAS_TABLE),
         headers=_airtable_headers(),
@@ -196,7 +208,12 @@ def airtable_find_placa(placa: str) -> dict[str, Any] | None:
     if resp.status_code != 200:
         raise AirtableError(f"GET Placas HTTP {resp.status_code}: {resp.text[:200]}")
     records = resp.json().get("records", [])
-    return records[0] if records else None
+    if not records:
+        return None
+    for rec in records:
+        if _registro_vigente(rec.get("fields", {})):
+            return rec
+    return records[0]
 
 
 def airtable_find_findesemana(cedula: str) -> dict[str, Any] | None:
