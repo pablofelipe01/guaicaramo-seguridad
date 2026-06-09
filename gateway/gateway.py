@@ -47,6 +47,7 @@ Config: ver .env.example y README.md.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -91,6 +92,12 @@ REQUEST_TIMEOUT_SECONDS = int(os.getenv("AIRTABLE_TIMEOUT", "15"))
 # Cada cuánto el poller revisa Airtable para notificarle al portero el resultado
 # de las solicitudes/alertas que recepción ya resolvió (aprobó o rechazó).
 GATEWAY_POLL_SECONDS = int(os.getenv("GATEWAY_POLL_SECONDS", "20"))
+# Volcado periódico del nodeDB (señal/lastHeard/batería) para el health-check externo.
+# Se escribe en memoria desde interface.nodes — NO toca el puerto serial, sin caídas.
+NODEDB_DUMP_PATH = os.getenv(
+    "NODEDB_DUMP_PATH", "/home/pfac/guaica-health/state/nodedb.json"
+).strip()
+NODEDB_DUMP_INTERVAL = int(os.getenv("NODEDB_DUMP_INTERVAL", "300"))  # segundos
 
 # ---------- Logging ----------
 
@@ -1620,6 +1627,34 @@ def run_simulator() -> None:
         pass
 
 
+def dump_nodedb(interface) -> None:
+    """Vuelca el nodeDB (señal, lastHeard, batería de cada nodo) a un JSON para el
+    health-check externo. Lee de interface.nodes (memoria), NO toca el puerto serial.
+    Envuelto en try/except: jamás debe tumbar el gateway."""
+    if not NODEDB_DUMP_PATH:
+        return
+    try:
+        nodes = getattr(interface, "nodes", None) or {}
+        my_num = (
+            interface.localNode.nodeNum
+            if getattr(interface, "localNode", None)
+            else None
+        )
+        snapshot = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "gateway_node_num": my_num,
+            "node_count": len(nodes),
+            "nodes": nodes,
+        }
+        os.makedirs(os.path.dirname(NODEDB_DUMP_PATH), exist_ok=True)
+        tmp = NODEDB_DUMP_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(snapshot, fh, default=str, ensure_ascii=False)
+        os.replace(tmp, NODEDB_DUMP_PATH)  # escritura atómica
+    except Exception as e:  # noqa: BLE001
+        log.debug("No se pudo volcar nodeDB: %s", e)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Guaicaramo Control Gateway")
     parser.add_argument(
@@ -1669,9 +1704,14 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
 
     log.info("🟢 Listo. Esperando mensajes…")
+    dump_nodedb(interface)  # volcado inicial
+    last_dump = time.time()
     try:
         while not stop:
             time.sleep(1)
+            if time.time() - last_dump >= NODEDB_DUMP_INTERVAL:
+                dump_nodedb(interface)
+                last_dump = time.time()
     finally:
         poller_stop.set()
         poller_thread.join(timeout=2)
