@@ -8,13 +8,13 @@ operaciones sobre Airtable.
 
 | Mensaje recibido (DM al gateway)                                  | Acción                                                                                          |
 | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `CONSULTA\|<requestId>\|<cedula>\|<placa>`                        | Busca placa en tabla `Placas`. Responde `RESPUESTA\|<requestId>\|APROBADO\|<conductor>` / `NO_APROBADO` / `ERROR\|<motivo>`. |
+| `CONSULTA\|<requestId>\|<cedula>\|<placa>` (y `CONSULTA_P`, `CONSULTA_F`) | Busca en la tabla maestra. Responde `RESPUESTA\|<requestId>\|<estado>[\|<nombre>]` con estado: `APROBADO` / `NO_REGISTRADO` (Caso 2) / `SIN_AUTORIZACION` (Caso 1 — auto-marca PENDIENTE + alerta) / `RECHAZADO` / `ERROR\|<motivo>`. |
 | `ENTRADA_V\|<cedula>\|<placa>\|<aprobadoPor>`                     | Inserta fila en `Registros` con `tipo=ENTRADA`, `entry_time` actual, `approved_by`.            |
 | `SALIDA_V\|<placa>`                                               | Busca el último `ENTRADA` sin salida para esa placa y le pone `exit_time`.                     |
 | `REGISTRO_MANUAL\|<status>\|<cedula>\|<placa>\|<supervisor>\|<c>` | Inserta fila con la aprobación manual (status = `APROBADO` / `NEGADO` / `PENDIENTE`).          |
-| `SOLICITUD_V\|<reqId>\|<cedula>\|<placa>\|<nombre>\|<comment>`     | Visitante no registrado: crea/actualiza fila `PENDIENTE` en `Placas` (`autorizado=false`, `estado=PENDIENTE`, `conductor=<nombre>`). Responde `RESP_SOL`. |
-| `SOLICITUD_P\|<reqId>\|<cedula>\|<nombre>\|<comment>`             | Igual en `Personas`. Responde `RESP_SOL`.                                                      |
-| `SOLICITUD_F\|<reqId>\|<cedula>\|<comment>`                       | Igual en `FinDeSemana` (`estado=PENDIENTE`). Responde `RESP_SOL`.                              |
+| `SOLICITUD_V\|<reqId>\|<cedula>\|<placa>\|<nombre>\|<motivo>`     | Caso 2: crea/actualiza fila `PENDIENTE` en `Placas` (`autorizado=false`, `conductor`, `motivo_visita`, `nodo_origen`). Responde `RESP_SOL`. |
+| `SOLICITUD_P\|<reqId>\|<cedula>\|<nombre>\|<motivo>`             | Igual en `Personas`. Responde `RESP_SOL`.                                                      |
+| `SOLICITUD_F\|<reqId>\|<cedula>\|<nombre>\|<motivo>`             | Igual en `FinDeSemana` (`estado=PENDIENTE`). Responde `RESP_SOL`.                              |
 
 > **Respuesta `RESP_SOL\|<reqId>\|<resultado>`** — resultado ∈ `REGISTRADA` (creada/actualizada a PENDIENTE), `RECHAZADA` (existe y está `RECHAZADO`, no se reabre), `YA_VIGENTE` (ya daría APROBADO; reconsultar), `ERROR`.
 >
@@ -23,6 +23,19 @@ operaciones sobre Airtable.
 > - Ya vigente (daría `APROBADO`) → `YA_VIGENTE`, no toca nada.
 > - `RECHAZADO` → `RECHAZADA`, no la reabre (un admin debe hacerlo en Airtable).
 > - Cualquier otro caso (no autorizada, vencida, pendiente) → la pone `PENDIENTE` → `REGISTRADA`.
+>
+> **Caso 1 (registrado sin autorización):** una `CONSULTA*` de alguien que ya
+> existe pero sin autorización activa devuelve `SIN_AUTORIZACION`, auto-marca la
+> fila `PENDIENTE` y guarda `nodo_origen` (alerta a recepción). El portero queda
+> bloqueado — no puede registrar ni enviar solicitud.
+>
+> **Notificación proactiva al portero (`RESULTADO_*`):** un hilo en background
+> sondea Airtable cada `GATEWAY_POLL_SECONDS` (def. 20s). Cuando recepción
+> resuelve una fila `PENDIENTE` con `nodo_origen` (marca `autorizado` /
+> `estado=AUTORIZADO`, o `estado=RECHAZADO`), el gateway envía
+> `RESULTADO_P\|<cedula>\|<AUTORIZADO\|RECHAZADO>\|<nombre>` (y `RESULTADO_V`,
+> `RESULTADO_F`) al nodo que originó la solicitud y marca `resultado_notificado`
+> para no repetir. El portero ve el veredicto sin reconsultar.
 >
 > **Aprobación asíncrona:** quien aprueba en Airtable marca `autorizado` (Placas/Personas) o `estado=AUTORIZADO` (FinDeSemana). La siguiente `CONSULTA` normal ya devuelve `APROBADO`.
 

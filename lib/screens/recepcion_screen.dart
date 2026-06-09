@@ -14,7 +14,13 @@ enum _RecepcionStage {
   idle,
   checking,
   approvedByGateway,
-  notApproved,
+  // Caso 2 — no existe en la base: se habilita el formulario de registro.
+  noRegistrado,
+  // Caso 1 — existe pero sin autorización activa: bloqueo total, alerta a
+  // recepción (la levanta el gateway). El portero no puede registrar.
+  sinAutorizacion,
+  // Existe pero fue RECHAZADO: requiere admin para reabrir.
+  rechazadoExistente,
   sendingSolicitud,
   solicitudEnviada,
   solicitudRechazada,
@@ -47,20 +53,42 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
 
   MeshtasticService get _service => widget.meshtasticService;
 
+  StreamSubscription<GatewayResultNotice>? _resultSub;
+
   @override
   void initState() {
     super.initState();
     _service.addListener(_onServiceChange);
+    // Resultado proactivo del gateway (recepción resolvió): snackbar prominente.
+    _resultSub = _service.gatewayResultStream.listen(_onGatewayResult);
   }
 
   @override
   void dispose() {
     _service.removeListener(_onServiceChange);
+    _resultSub?.cancel();
     _cedulaController.dispose();
     _placaController.dispose();
     _nombreController.dispose();
     _porteroCommentController.dispose();
     super.dispose();
+  }
+
+  void _onGatewayResult(GatewayResultNotice n) {
+    if (!mounted) return;
+    final quien = (n.nombre != null && n.nombre!.isNotEmpty) ? n.nombre! : n.key;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: n.aprobado ? Colors.green.shade700 : Colors.red.shade700,
+        duration: const Duration(seconds: 6),
+        content: Text(
+          n.aprobado
+              ? '✓ Recepción AUTORIZÓ a $quien (${n.categoriaLabel})'
+              : '✕ Recepción RECHAZÓ a $quien (${n.categoriaLabel})',
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+      ),
+    );
   }
 
   void _onServiceChange() {
@@ -86,7 +114,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   String get _porteroComment => _porteroCommentController.text.trim();
 
   bool get _isVehicle => _mode == _AccessMode.vehiculo;
-  bool get _isPersona => _mode == _AccessMode.persona;
   bool get _isFinDeSemana => _mode == _AccessMode.finDeSemana;
 
   Future<void> _verify() async {
@@ -139,8 +166,14 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     switch (status) {
       case PlateCheckStatus.approved:
         return _RecepcionStage.approvedByGateway;
+      case PlateCheckStatus.notRegistered:
+      // Gateway viejo (NO_APROBADO genérico): tratar como no registrado.
       case PlateCheckStatus.notApproved:
-        return _RecepcionStage.notApproved;
+        return _RecepcionStage.noRegistrado;
+      case PlateCheckStatus.registeredUnauthorized:
+        return _RecepcionStage.sinAutorizacion;
+      case PlateCheckStatus.rejected:
+        return _RecepcionStage.rechazadoExistente;
       case PlateCheckStatus.timeout:
       case PlateCheckStatus.error:
         return _RecepcionStage.error;
@@ -195,9 +228,16 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _showSnack('Sin conexión al nodo Meshtastic');
       return;
     }
-    // En vehículo el nombre del conductor es obligatorio para la solicitud.
-    if (_isVehicle && _nombre.isEmpty) {
-      _showSnack('Ingresa el nombre del conductor');
+    // Caso 2: nombre y motivo de visita son obligatorios (datos incompletos →
+    // error, no se permite enviar).
+    if (_nombre.isEmpty) {
+      _showSnack(_isVehicle
+          ? 'Ingresa el nombre del conductor'
+          : 'Ingresa el nombre de la persona');
+      return;
+    }
+    if (_porteroComment.isEmpty) {
+      _showSnack('Ingresa el motivo de la visita');
       return;
     }
 
@@ -215,12 +255,13 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     } else if (_isFinDeSemana) {
       result = await _service.sendSolicitudFinDeSToGateway(
         cedula: _cedula,
+        nombre: _nombre,
         comment: comment,
       );
     } else {
       result = await _service.sendSolicitudPersonaToGateway(
         cedula: _cedula,
-        nombre: _nombre.isNotEmpty ? _nombre : null,
+        nombre: _nombre,
         comment: comment,
       );
     }
@@ -378,18 +419,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 if (v.trim().length < 4) return 'Placa muy corta';
                 return null;
               },
-            )
-          else if (_isPersona)
-            TextFormField(
-              controller: _nombreController,
-              textCapitalization: TextCapitalization.words,
-              decoration: const InputDecoration(
-                labelText: 'Nombre (opcional, solo para aprobación manual)',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.person),
-              ),
             ),
-          // En modo fin-de-semana solo se pide la CC.
+          // En persona y fin-de-semana solo se pide la CC; el nombre se captura
+          // en el formulario de registro (Caso 2) si no está registrado.
           const SizedBox(height: 20),
           ElevatedButton.icon(
             onPressed: _stage == _RecepcionStage.checking || !_service.isConnected
@@ -474,8 +506,14 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           onReset: _resetForm,
         );
 
-      case _RecepcionStage.notApproved:
-        return _buildNotApprovedCard();
+      case _RecepcionStage.noRegistrado:
+        return _buildRegistroCard();
+
+      case _RecepcionStage.sinAutorizacion:
+        return _buildSinAutorizacionCard();
+
+      case _RecepcionStage.rechazadoExistente:
+        return _buildRechazadoCard();
 
       case _RecepcionStage.sendingSolicitud:
         return Card(
@@ -566,14 +604,16 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     }
   }
 
-  Widget _buildNotApprovedCard() {
+  /// Caso 2 — la persona/placa NO existe en la base. Formulario de registro:
+  /// nombre + motivo de visita obligatorios → se envía a aprobación de recepción.
+  Widget _buildRegistroCard() {
     final String label;
     if (_isVehicle) {
-      label = 'La placa $_placa no está en la lista.';
+      label = 'La placa $_placa no está registrada.';
     } else if (_isFinDeSemana) {
       label = 'La cédula $_cedula no está en la lista de fin de semana.';
     } else {
-      label = 'La cédula $_cedula no está en la lista de personas.';
+      label = 'La cédula $_cedula no está registrada.';
     }
 
     return Card(
@@ -586,11 +626,11 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           children: [
             Row(
               children: [
-                const Icon(Icons.warning_amber, color: Colors.orange, size: 32),
+                const Icon(Icons.person_add_alt, color: Colors.orange, size: 32),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
-                    _isVehicle ? 'Placa no autorizada' : 'Persona no autorizada',
+                    _isVehicle ? 'Placa no registrada' : 'Persona no registrada',
                     style: const TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
@@ -601,25 +641,21 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              '$label Envía la solicitud para aprobación en Airtable.',
+              '$label Completa los datos y envía a aprobación de recepción.',
               style: const TextStyle(fontSize: 14),
             ),
             const SizedBox(height: 16),
-            // En vehículo pedimos el nombre del conductor (obligatorio) para
-            // guardarlo en Placas junto con la placa y la cédula.
-            if (_isVehicle) ...[
-              TextField(
-                controller: _nombreController,
-                textCapitalization: TextCapitalization.words,
-                decoration: const InputDecoration(
-                  labelText: 'Nombre del conductor',
-                  hintText: 'Nombre y apellido',
-                  border: OutlineInputBorder(),
-                  prefixIcon: Icon(Icons.person),
-                ),
+            TextField(
+              controller: _nombreController,
+              textCapitalization: TextCapitalization.words,
+              decoration: InputDecoration(
+                labelText: _isVehicle ? 'Nombre del conductor *' : 'Nombre *',
+                hintText: 'Nombre y apellido',
+                border: const OutlineInputBorder(),
+                prefixIcon: const Icon(Icons.person),
               ),
-              const SizedBox(height: 12),
-            ],
+            ),
+            const SizedBox(height: 12),
             TextField(
               controller: _porteroCommentController,
               minLines: 2,
@@ -627,7 +663,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
               maxLength: 150,
               textCapitalization: TextCapitalization.sentences,
               decoration: const InputDecoration(
-                labelText: 'Contexto para quien aprueba (opcional)',
+                labelText: 'Motivo de visita *',
                 hintText: 'Ej: "viene a entregar paquete", '
                     '"es proveedor de la podadora", etc.',
                 border: OutlineInputBorder(),
@@ -638,7 +674,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
             ElevatedButton.icon(
               onPressed: _requestGatewayApproval,
               icon: const Icon(Icons.send),
-              label: const Text('Enviar solicitud de aprobación'),
+              label: const Text('Enviar a aprobación'),
               style: ElevatedButton.styleFrom(
                 backgroundColor: Colors.orange,
                 foregroundColor: Colors.white,
@@ -652,6 +688,90 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           ],
         ),
       ),
+    );
+  }
+
+  /// Caso 1 — la persona/placa YA existe pero sin autorización activa. Bloqueo
+  /// total: el portero no puede registrar. El gateway ya levantó la alerta a
+  /// recepción y avisará el resultado por push.
+  Widget _buildSinAutorizacionCard() {
+    final nombre = _isVehicle
+        ? _lastPlateCheck?.driverName
+        : _lastPersonCheck?.personName;
+    final quien = (nombre != null && nombre.isNotEmpty)
+        ? nombre
+        : (_isVehicle ? 'La placa $_placa' : 'La cédula $_cedula');
+
+    return Card(
+      color: Colors.red.shade50,
+      elevation: 3,
+      child: Padding(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          children: [
+            const Icon(Icons.gpp_bad, color: Colors.red, size: 48),
+            const SizedBox(height: 12),
+            const Text(
+              'SIN AUTORIZACIÓN',
+              style: TextStyle(
+                fontSize: 22,
+                fontWeight: FontWeight.bold,
+                color: Colors.red,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '$quien está registrado pero NO tiene autorización de ingreso activa.',
+              style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w500),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade200),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.notifications_active, color: Colors.red, size: 20),
+                  SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Se notificó a recepción. No puedes autorizar el ingreso. '
+                      'Espera la decisión — te avisaremos aquí.',
+                      style: TextStyle(fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            TextButton.icon(
+              onPressed: _resetForm,
+              icon: const Icon(Icons.add),
+              label: const Text('Nueva consulta'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Existe pero fue RECHAZADO previamente: requiere admin para reabrir.
+  Widget _buildRechazadoCard() {
+    final subtitle = _isVehicle
+        ? 'La placa $_placa fue rechazada.'
+        : 'La cédula $_cedula fue rechazada.';
+    return _ResultCard(
+      icon: Icons.block,
+      color: Colors.red,
+      title: 'RECHAZADA',
+      subtitle: subtitle,
+      info: 'No se reabre desde la app. Si debe entrar, un administrador '
+          'tiene que habilitarla en Airtable.',
+      onReset: _resetForm,
     );
   }
 
@@ -806,6 +926,40 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     );
   }
 
+  /// Banner con los resultados que recepción ya resolvió (push del gateway).
+  /// El portero los ve aunque haya seguido con otra consulta.
+  Widget _buildResultsBanner() {
+    final results = _service.gatewayResults;
+    if (results.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final r in results.reversed)
+          Card(
+            elevation: 2,
+            color: r.aprobado ? Colors.green.shade50 : Colors.red.shade50,
+            child: ListTile(
+              leading: Icon(
+                r.aprobado ? Icons.check_circle : Icons.cancel,
+                color: r.aprobado ? Colors.green : Colors.red,
+              ),
+              title: Text(
+                '${r.titulo} — ${(r.nombre != null && r.nombre!.isNotEmpty) ? r.nombre! : r.key}',
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+              ),
+              subtitle: Text('${r.categoriaLabel} · ${r.key}'),
+              trailing: IconButton(
+                icon: const Icon(Icons.close),
+                tooltip: 'Descartar',
+                onPressed: () => _service.dismissGatewayResult(r),
+              ),
+            ),
+          ),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
   bool get _isFormStage =>
       _stage == _RecepcionStage.idle || _stage == _RecepcionStage.checking;
 
@@ -847,6 +1001,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 padding: EdgeInsets.only(bottom: 16.0),
                 child: LinearProgressIndicator(),
               ),
+            _buildResultsBanner(),
             Center(child: _buildModeToggle()),
             const SizedBox(height: 16),
             if (_isFormStage) _buildForm(),

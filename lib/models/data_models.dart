@@ -337,7 +337,58 @@ class VehicleRequest {
       );
 }
 
-enum PlateCheckStatus { approved, notApproved, timeout, error }
+/// Resultado de una consulta (CONSULTA / CONSULTA_P / CONSULTA_F) al gateway.
+/// - [approved]: autorizado y vigente → puede registrar entrada.
+/// - [notRegistered]: no existe en la base (Caso 2 → habilitar formulario).
+/// - [registeredUnauthorized]: existe pero sin autorización activa (Caso 1 →
+///   bloqueo total; el gateway ya levantó la alerta a recepción).
+/// - [rejected]: existe pero fue RECHAZADO (requiere admin para reabrir).
+/// - [notApproved]: compatibilidad con gateways viejos (NO_APROBADO genérico).
+enum PlateCheckStatus {
+  approved,
+  notRegistered,
+  registeredUnauthorized,
+  rejected,
+  notApproved,
+  timeout,
+  error,
+}
+
+/// Categoría de un resultado proactivo del gateway.
+enum GatewayResultCategory { vehiculo, persona, finDeSemana }
+
+/// Notificación PROACTIVA (push) del gateway al portero: recepción ya resolvió
+/// una solicitud/alerta (Caso 1 o Caso 2). Llega vía `RESULTADO_*` sin que la
+/// app la haya pedido. El portero no tiene que volver a consultar.
+class GatewayResultNotice {
+  final GatewayResultCategory categoria;
+  /// Placa (vehículo) o cédula (persona / fin de semana).
+  final String key;
+  final bool aprobado; // true=AUTORIZADO, false=RECHAZADO
+  final String? nombre;
+  final DateTime timestamp;
+
+  GatewayResultNotice({
+    required this.categoria,
+    required this.key,
+    required this.aprobado,
+    this.nombre,
+    required this.timestamp,
+  });
+
+  String get titulo => aprobado ? 'AUTORIZADO' : 'RECHAZADO';
+
+  String get categoriaLabel {
+    switch (categoria) {
+      case GatewayResultCategory.vehiculo:
+        return 'Vehículo';
+      case GatewayResultCategory.persona:
+        return 'Persona';
+      case GatewayResultCategory.finDeSemana:
+        return 'Fin de semana';
+    }
+  }
+}
 
 /// Resultado de una SOLICITUD_* al gateway (visitante no registrado).
 /// El gateway responde `RESP_SOL|<reqId>|<resultado>`.
@@ -372,6 +423,10 @@ class PlateCheckResult {
 
   bool get isApproved => status == PlateCheckStatus.approved;
   bool get isNotApproved => status == PlateCheckStatus.notApproved;
+  bool get isNotRegistered => status == PlateCheckStatus.notRegistered;
+  bool get isRegisteredUnauthorized =>
+      status == PlateCheckStatus.registeredUnauthorized;
+  bool get isRejected => status == PlateCheckStatus.rejected;
   bool get isTimeout => status == PlateCheckStatus.timeout;
   bool get isError => status == PlateCheckStatus.error;
 }
@@ -546,6 +601,10 @@ class PersonCheckResult {
 
   bool get isApproved => status == PlateCheckStatus.approved;
   bool get isNotApproved => status == PlateCheckStatus.notApproved;
+  bool get isNotRegistered => status == PlateCheckStatus.notRegistered;
+  bool get isRegisteredUnauthorized =>
+      status == PlateCheckStatus.registeredUnauthorized;
+  bool get isRejected => status == PlateCheckStatus.rejected;
   bool get isTimeout => status == PlateCheckStatus.timeout;
   bool get isError => status == PlateCheckStatus.error;
 }

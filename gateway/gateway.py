@@ -4,10 +4,14 @@ Guaicaramo Control — Gateway Meshtastic ↔ Airtable.
 
 Escucha mensajes en la red mesh y los traduce a operaciones en Airtable:
 
-  CONSULTA|<requestId>|<cedula>|<placa>
-      → busca la placa en la tabla `Placas` y responde
-        RESPUESTA|<requestId>|APROBADO|<conductor>
-        RESPUESTA|<requestId>|NO_APROBADO
+  CONSULTA|<requestId>|<cedula>|<placa>      (análogo: CONSULTA_P, CONSULTA_F)
+      → busca la placa/persona en la tabla maestra y responde uno de:
+        RESPUESTA|<requestId>|APROBADO|<conductor>     (autorizado y vigente)
+        RESPUESTA|<requestId>|NO_REGISTRADO            (Caso 2: no existe en la base)
+        RESPUESTA|<requestId>|SIN_AUTORIZACION|<conductor>
+              (Caso 1: existe pero sin autorización activa. El gateway auto-marca
+               la fila PENDIENTE y guarda nodo_origen para alertar a recepción.)
+        RESPUESTA|<requestId>|RECHAZADO|<conductor>    (existe pero RECHAZADO)
         RESPUESTA|<requestId>|ERROR|<motivo>
 
   ENTRADA_V|<cedula>|<placa>|<aprobadoPor>
@@ -20,17 +24,22 @@ Escucha mensajes en la red mesh y los traduce a operaciones en Airtable:
       → inserta fila en `Registros` con la aprobación manual (status puede ser
         APROBADO, NEGADO o PENDIENTE).
 
-  SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>
-  SOLICITUD_P|<reqId>|<cedula>|<nombre>|<comment>
-  SOLICITUD_F|<reqId>|<cedula>|<comment>
-      → visitante NO registrado: crea/actualiza una fila PENDIENTE en la tabla
-        maestra (Placas / Personas / FinDeSemana) sin autorizar, guardando el
-        nombre. Nunca duplica (reusa la fila si ya existe). Responde
-        RESP_SOL|<reqId>|<REGISTRADA|RECHAZADA|YA_VIGENTE|ERROR>.
-        Alguien la aprueba luego en Airtable y la siguiente consulta ya
-        devuelve APROBADO.
+  SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<motivo>
+  SOLICITUD_P|<reqId>|<cedula>|<nombre>|<motivo>
+  SOLICITUD_F|<reqId>|<cedula>|<nombre>|<motivo>
+      → Caso 2 (visitante NO registrado): crea/actualiza una fila PENDIENTE en la
+        tabla maestra (Placas / Personas / FinDeSemana) sin autorizar, guardando
+        nombre, motivo de visita y nodo_origen. Nunca duplica (reusa la fila si
+        ya existe). Responde RESP_SOL|<reqId>|<REGISTRADA|RECHAZADA|YA_VIGENTE|ERROR>.
 
-El gateway sólo procesa mensajes que llegan como DM (destino == este nodo).
+  RESULTADO_P|<cedula>|<AUTORIZADO|RECHAZADO>|<nombre>   (análogo: RESULTADO_V, RESULTADO_F)
+      → mensaje PROACTIVO del gateway al portero (nodo_origen). Un hilo en
+        background sondea Airtable cada GATEWAY_POLL_SECONDS y, cuando recepción
+        resuelve una fila PENDIENTE (autorizado / estado=AUTORIZADO o RECHAZADO),
+        le notifica el resultado al portero que la originó y marca
+        resultado_notificado=true para no repetir.
+
+El gateway sólo procesa mensajes entrantes que llegan como DM (destino == este nodo).
 
 Config: ver .env.example y README.md.
 """
@@ -42,6 +51,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 import urllib.parse
@@ -77,6 +87,10 @@ MESHTASTIC_TCP = os.getenv("MESHTASTIC_TCP", "").strip()         # ej: 192.168.1
 MESHTASTIC_BLE = os.getenv("MESHTASTIC_BLE", "").strip()         # ej: AA:BB:CC:DD:EE:FF
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("AIRTABLE_TIMEOUT", "15"))
+
+# Cada cuánto el poller revisa Airtable para notificarle al portero el resultado
+# de las solicitudes/alertas que recepción ya resolvió (aprobó o rechazó).
+GATEWAY_POLL_SECONDS = int(os.getenv("GATEWAY_POLL_SECONDS", "20"))
 
 # ---------- Logging ----------
 
@@ -316,6 +330,22 @@ def airtable_update_record(table: str, record_id: str, fields: dict[str, Any]) -
         )
 
 
+def airtable_list(table: str, formula: str, max_records: int = 100) -> list[dict[str, Any]]:
+    """Lista filas de una tabla que cumplen `formula` (filterByFormula)."""
+    params = {"filterByFormula": formula, "maxRecords": max_records}
+    resp = requests.get(
+        _airtable_url(table),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    if resp.status_code != 200:
+        raise AirtableError(
+            f"GET {table} HTTP {resp.status_code}: {resp.text[:200]}"
+        )
+    return resp.json().get("records", [])
+
+
 def airtable_create_registro(fields: dict[str, Any]) -> str:
     # typecast=true permite que Airtable cree nuevas opciones de singleSelect
     # al vuelo (ej: categoria='FIN_DE_SEMANA' que no estaba pre-definida).
@@ -429,6 +459,31 @@ def _node_hex(node_num: int) -> str:
     return f"!{node_num & 0xFFFFFFFF:08x}"
 
 
+def _flag_pendiente_alerta(table: str, record: dict[str, Any], from_num: int) -> None:
+    """Caso 1: la persona/placa ya existe pero no tiene autorización activa.
+
+    Marca la fila como PENDIENTE (si no lo estaba ya) para que aparezca en la
+    cola de recepción en Airtable, y guarda el `nodo_origen` del portero que
+    consultó + `resultado_notificado`=False, de modo que el poller le notifique
+    cuando recepción la resuelva. Idempotente: nunca crea una fila nueva.
+    """
+    fields = record.get("fields", {})
+    estado = (fields.get("estado") or "").strip().upper()
+    update: dict[str, Any] = {
+        "nodo_origen": _node_hex(from_num),
+        "resultado_notificado": False,
+    }
+    if estado != "PENDIENTE":
+        update["estado"] = "PENDIENTE"
+    try:
+        airtable_update_record(table, record["id"], update)
+        log.info("🔔 Caso 1: fila %s marcada PENDIENTE + alerta a recepción.",
+                 record.get("id"))
+    except Exception:
+        log.error("No se pudo marcar PENDIENTE la alerta:\n%s",
+                  traceback.format_exc())
+
+
 # ---------- Handlers de protocolo ----------
 
 
@@ -446,29 +501,40 @@ def handle_consulta(interface, from_num: int, parts: list[str]) -> None:
     try:
         record = airtable_find_placa(placa)
         if record is None:
-            send_text(interface, from_num, f"RESPUESTA|{request_id}|NO_APROBADO")
+            # Caso 2: la placa no existe en la base.
+            send_text(interface, from_num, f"RESPUESTA|{request_id}|NO_REGISTRADO")
             return
 
         fields = record.get("fields", {})
-        authorized = bool(fields.get("autorizado"))
-        if not authorized:
-            send_text(interface, from_num, f"RESPUESTA|{request_id}|NO_APROBADO")
-            return
-
-        # Verificar vencimiento si existe.
+        conductor = (fields.get("conductor") or "").strip()
         # Airtable retorna dateTime en ISO 8601 con tz (UTC):
         #   "2026-05-21T18:00:00.000Z" o "2026-05-21" si el campo es solo date.
         vence = fields.get("vence")
-        if vence and _is_expired(vence):
-            log.info("Placa %s vencida (%s).", placa, vence)
-            send_text(interface, from_num, f"RESPUESTA|{request_id}|NO_APROBADO")
+        authorized = bool(fields.get("autorizado")) and not (
+            vence and _is_expired(vence)
+        )
+        estado = (fields.get("estado") or "").strip().upper()
+
+        if authorized:
+            send_text(
+                interface, from_num,
+                f"RESPUESTA|{request_id}|APROBADO|{conductor}",
+            )
             return
 
-        conductor = (fields.get("conductor") or "").strip()
+        if estado == "RECHAZADO":
+            send_text(
+                interface, from_num,
+                f"RESPUESTA|{request_id}|RECHAZADO|{conductor}",
+            )
+            return
+
+        # Caso 1: existe pero sin autorización activa (no autorizado, vencido o
+        # pendiente). Bloqueo total — el gateway levanta la alerta a recepción.
+        _flag_pendiente_alerta(AIRTABLE_PLACAS_TABLE, record, from_num)
         send_text(
-            interface,
-            from_num,
-            f"RESPUESTA|{request_id}|APROBADO|{conductor}",
+            interface, from_num,
+            f"RESPUESTA|{request_id}|SIN_AUTORIZACION|{conductor}",
         )
 
     except AirtableError as e:
@@ -613,24 +679,32 @@ def handle_consulta_persona(interface, from_num: int, parts: list[str]) -> None:
     try:
         record = airtable_find_persona(cedula)
         if record is None:
-            send_text(interface, from_num, f"RESPUESTA_P|{request_id}|NO_APROBADO")
+            # Caso 2: la persona no existe en la base.
+            send_text(interface, from_num, f"RESPUESTA_P|{request_id}|NO_REGISTRADO")
             return
 
         fields = record.get("fields", {})
-        if not bool(fields.get("autorizado")):
-            send_text(interface, from_num, f"RESPUESTA_P|{request_id}|NO_APROBADO")
-            return
-
-        vence = fields.get("vence")
-        if vence and _is_expired(vence):
-            log.info("Persona %s vencida (%s).", cedula, vence)
-            send_text(interface, from_num,
-                      f"RESPUESTA_P|{request_id}|NO_APROBADO")
-            return
-
         nombre = (fields.get("nombre") or "").strip()
+        vence = fields.get("vence")
+        authorized = bool(fields.get("autorizado")) and not (
+            vence and _is_expired(vence)
+        )
+        estado = (fields.get("estado") or "").strip().upper()
+
+        if authorized:
+            send_text(interface, from_num,
+                      f"RESPUESTA_P|{request_id}|APROBADO|{nombre}")
+            return
+
+        if estado == "RECHAZADO":
+            send_text(interface, from_num,
+                      f"RESPUESTA_P|{request_id}|RECHAZADO|{nombre}")
+            return
+
+        # Caso 1: existe pero sin autorización activa → bloqueo + alerta a recepción.
+        _flag_pendiente_alerta(AIRTABLE_PERSONAS_TABLE, record, from_num)
         send_text(interface, from_num,
-                  f"RESPUESTA_P|{request_id}|APROBADO|{nombre}")
+                  f"RESPUESTA_P|{request_id}|SIN_AUTORIZACION|{nombre}")
 
     except AirtableError as e:
         log.error("AirtableError en CONSULTA_P: %s", e)
@@ -759,22 +833,32 @@ def handle_consulta_findesemana(interface, from_num: int, parts: list[str]) -> N
     try:
         record = airtable_find_findesemana(cedula)
         if record is None:
+            # Caso 2: la persona no existe en la lista de fin de semana.
             send_text(interface, from_num,
-                      f"RESPUESTA_F|{request_id}|NO_APROBADO")
+                      f"RESPUESTA_F|{request_id}|NO_REGISTRADO")
             return
         f = record.get("fields", {})
         estado = (f.get("estado") or "").strip().upper()
-        if estado in ("PENDIENTE", "RECHAZADO"):
-            log.info("FinDeSemana %s en estado %s → NO_APROBADO.", cedula, estado)
-            send_text(interface, from_num,
-                      f"RESPUESTA_F|{request_id}|NO_APROBADO")
-            return
         nombre = _truncate(f.get("nombre", ""), 40)
         area = _truncate(f.get("area", ""), 30)
-        send_text(
-            interface, from_num,
-            f"RESPUESTA_F|{request_id}|APROBADO|{nombre}|{area}",
-        )
+
+        # En FinDeSemana el "gate" es `estado`: vacío o AUTORIZADO → vale.
+        if estado in ("", "AUTORIZADO"):
+            send_text(
+                interface, from_num,
+                f"RESPUESTA_F|{request_id}|APROBADO|{nombre}|{area}",
+            )
+            return
+
+        if estado == "RECHAZADO":
+            send_text(interface, from_num,
+                      f"RESPUESTA_F|{request_id}|RECHAZADO|{nombre}|{area}")
+            return
+
+        # estado == PENDIENTE → Caso 1: ya existe pero sin autorización.
+        _flag_pendiente_alerta(AIRTABLE_FINDESEMANA_TABLE, record, from_num)
+        send_text(interface, from_num,
+                  f"RESPUESTA_F|{request_id}|SIN_AUTORIZACION|{nombre}|{area}")
     except AirtableError as e:
         log.error("AirtableError en CONSULTA_F: %s", e)
         send_text(interface, from_num,
@@ -1103,6 +1187,7 @@ def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> Non
 
     try:
         existing = airtable_find_placa(placa)
+        node = _node_hex(from_num)
         if existing is None:
             fields = {
                 "placa": placa,
@@ -1110,6 +1195,9 @@ def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> Non
                 "autorizado": False,
                 "estado": "PENDIENTE",
                 "notas": comment,
+                "motivo_visita": comment,
+                "nodo_origen": node,
+                "resultado_notificado": False,
             }
             if nombre:
                 fields["conductor"] = nombre
@@ -1128,7 +1216,13 @@ def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> Non
             log.info("Placa %s RECHAZADA — no se reabre (requiere admin).", placa)
             _send_resp_sol(interface, from_num, request_id, "RECHAZADA")
             return
-        update = {"estado": "PENDIENTE"}
+        update = {
+            "estado": "PENDIENTE",
+            "nodo_origen": node,
+            "resultado_notificado": False,
+        }
+        if comment:
+            update["motivo_visita"] = comment
         if nombre and not (f.get("conductor") or "").strip():
             update["conductor"] = nombre
         airtable_update_record(AIRTABLE_PLACAS_TABLE, existing["id"], update)
@@ -1159,12 +1253,16 @@ def handle_solicitud_persona(interface, from_num: int, parts: list[str]) -> None
 
     try:
         existing = airtable_find_persona(cedula)
+        node = _node_hex(from_num)
         if existing is None:
             fields = {
                 "cedula": cedula,
                 "autorizado": False,
                 "estado": "PENDIENTE",
                 "notas": comment,
+                "motivo_visita": comment,
+                "nodo_origen": node,
+                "resultado_notificado": False,
             }
             if nombre:
                 fields["nombre"] = nombre
@@ -1183,7 +1281,13 @@ def handle_solicitud_persona(interface, from_num: int, parts: list[str]) -> None
             log.info("Persona %s RECHAZADA — no se reabre (requiere admin).", cedula)
             _send_resp_sol(interface, from_num, request_id, "RECHAZADA")
             return
-        update = {"estado": "PENDIENTE"}
+        update = {
+            "estado": "PENDIENTE",
+            "nodo_origen": node,
+            "resultado_notificado": False,
+        }
+        if comment:
+            update["motivo_visita"] = comment
         if nombre and not (f.get("nombre") or "").strip():
             update["nombre"] = nombre
         airtable_update_record(AIRTABLE_PERSONAS_TABLE, existing["id"], update)
@@ -1198,36 +1302,42 @@ def handle_solicitud_persona(interface, from_num: int, parts: list[str]) -> None
 
 
 def handle_solicitud_findesemana(interface, from_num: int, parts: list[str]) -> None:
-    """SOLICITUD_F|<reqId>|<cedula>|<comment>.
+    """SOLICITUD_F|<reqId>|<cedula>|<nombre>|<motivo>.
     Crea/actualiza fila PENDIENTE en FinDeSemana y responde RESP_SOL."""
     if len(parts) < 3:
         log.warning("SOLICITUD_F formato inválido: %s", parts)
         return
     request_id = parts[1]
     cedula = parts[2].strip()
-    comment = parts[3] if len(parts) > 3 else ""
+    nombre = parts[3].strip() if len(parts) > 3 else ""
+    comment = parts[4] if len(parts) > 4 else ""
     log.info(
-        "🗓️ SOLICITUD_F req=%s cedula=%s de %s",
-        request_id, cedula, _node_hex(from_num),
+        "🗓️ SOLICITUD_F req=%s cedula=%s nombre=%s de %s",
+        request_id, cedula, nombre or "—", _node_hex(from_num),
     )
 
     try:
         existing = airtable_find_findesemana(cedula)
+        node = _node_hex(from_num)
         if existing is None:
-            record_id = airtable_create_record(
-                AIRTABLE_FINDESEMANA_TABLE,
-                {
-                    "cedula": cedula,
-                    "estado": "PENDIENTE",
-                    "resumen": comment,
-                },
-            )
+            fields = {
+                "cedula": cedula,
+                "estado": "PENDIENTE",
+                "resumen": comment,
+                "motivo_visita": comment,
+                "nodo_origen": node,
+                "resultado_notificado": False,
+            }
+            if nombre:
+                fields["nombre"] = nombre
+            record_id = airtable_create_record(AIRTABLE_FINDESEMANA_TABLE, fields)
             log.info("✓ Solicitud fin-de-semana creada PENDIENTE (record %s)", record_id)
             _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
             return
         # La fila ya existe → NUNCA duplicar. Reusar la misma fila.
         # En FinDeSemana el "gate" es `estado`: vacío o AUTORIZADO ya vale.
-        estado = (existing.get("fields", {}).get("estado") or "").strip().upper()
+        f = existing.get("fields", {})
+        estado = (f.get("estado") or "").strip().upper()
         if estado in ("", "AUTORIZADO"):
             log.info("FinDeSemana %s ya vale — no se crea solicitud.", cedula)
             _send_resp_sol(interface, from_num, request_id, "YA_VIGENTE")
@@ -1236,9 +1346,16 @@ def handle_solicitud_findesemana(interface, from_num: int, parts: list[str]) -> 
             log.info("FinDeSemana %s RECHAZADA — no se reabre (requiere admin).", cedula)
             _send_resp_sol(interface, from_num, request_id, "RECHAZADA")
             return
-        airtable_update_record(
-            AIRTABLE_FINDESEMANA_TABLE, existing["id"], {"estado": "PENDIENTE"}
-        )
+        update = {
+            "estado": "PENDIENTE",
+            "nodo_origen": node,
+            "resultado_notificado": False,
+        }
+        if comment:
+            update["motivo_visita"] = comment
+        if nombre and not (f.get("nombre") or "").strip():
+            update["nombre"] = nombre
+        airtable_update_record(AIRTABLE_FINDESEMANA_TABLE, existing["id"], update)
         log.info("✓ FinDeSemana %s marcada PENDIENTE (fila existente).", cedula)
         _send_resp_sol(interface, from_num, request_id, "REGISTRADA")
     except AirtableError as e:
@@ -1247,6 +1364,95 @@ def handle_solicitud_findesemana(interface, from_num: int, parts: list[str]) -> 
     except Exception:
         log.error("Excepción en SOLICITUD_F:\n%s", traceback.format_exc())
         _send_resp_sol(interface, from_num, request_id, "ERROR")
+
+
+# ---------- Poller: notifica al portero el resultado de las solicitudes ----------
+#
+# La app del portero no se queda esperando: cuando recepción aprueba o rechaza en
+# Airtable, este hilo lo detecta y le manda un mensaje proactivo RESULTADO_* al
+# nodo que originó la solicitud/alerta. Marca `resultado_notificado` para no
+# repetir. Cubre Caso 1 (alertas auto-marcadas en CONSULTA) y Caso 2 (SOLICITUD).
+
+
+def _resultado_de_fila(fields: dict[str, Any], use_autorizado: bool) -> str | None:
+    """Decide si una fila PENDIENTE ya fue resuelta por recepción.
+
+    Devuelve 'AUTORIZADO', 'RECHAZADO' o None (sigue pendiente).
+    - Placas/Personas: aprobado = `autorizado` marcado y no vencido.
+    - FinDeSemana: aprobado = estado == AUTORIZADO (no tiene checkbox).
+    """
+    estado = (fields.get("estado") or "").strip().upper()
+    if estado == "RECHAZADO":
+        return "RECHAZADO"
+    if use_autorizado:
+        vence = fields.get("vence")
+        if bool(fields.get("autorizado")) and not (vence and _is_expired(vence)):
+            return "AUTORIZADO"
+        return None
+    # FinDeSemana
+    if estado == "AUTORIZADO":
+        return "AUTORIZADO"
+    return None
+
+
+def _notificar_resueltas(
+    interface,
+    table: str,
+    prefix: str,
+    key_field: str,
+    name_field: str,
+    use_autorizado: bool,
+) -> None:
+    """Busca filas con nodo_origen, sin notificar y ya resueltas; avisa al portero."""
+    # NOT({resultado_notificado}) cubre tanto el checkbox desmarcado como vacío.
+    formula = "AND({nodo_origen} != '', NOT({resultado_notificado}))"
+    records = airtable_list(table, formula)
+    for rec in records:
+        fields = rec.get("fields", {})
+        nodo = (fields.get("nodo_origen") or "").strip()
+        if not nodo:
+            continue
+        resultado = _resultado_de_fila(fields, use_autorizado)
+        if resultado is None:
+            continue  # sigue PENDIENTE — se revisará en el próximo ciclo
+        try:
+            dest = int(nodo.lstrip("!"), 16)
+        except ValueError:
+            log.warning("nodo_origen inválido en %s: %r", table, nodo)
+            continue
+        key = (fields.get(key_field) or "").strip()
+        nombre = (fields.get(name_field) or "").strip()
+        send_text(interface, dest, f"{prefix}|{key}|{resultado}|{nombre}")
+        airtable_update_record(table, rec["id"], {"resultado_notificado": True})
+        log.info("📣 %s notificado a %s (%s=%s)", resultado, nodo, key_field, key)
+
+
+def poll_once(interface) -> None:
+    """Una pasada del poller sobre las tres tablas maestras."""
+    _notificar_resueltas(
+        interface, AIRTABLE_PERSONAS_TABLE, "RESULTADO_P",
+        key_field="cedula", name_field="nombre", use_autorizado=True,
+    )
+    _notificar_resueltas(
+        interface, AIRTABLE_PLACAS_TABLE, "RESULTADO_V",
+        key_field="placa", name_field="conductor", use_autorizado=True,
+    )
+    _notificar_resueltas(
+        interface, AIRTABLE_FINDESEMANA_TABLE, "RESULTADO_F",
+        key_field="cedula", name_field="nombre", use_autorizado=False,
+    )
+
+
+def poller_loop(interface, stop_event: threading.Event) -> None:
+    """Hilo background: cada GATEWAY_POLL_SECONDS notifica resultados resueltos."""
+    log.info("🔄 Poller de resultados activo (cada %ds).", GATEWAY_POLL_SECONDS)
+    while not stop_event.wait(GATEWAY_POLL_SECONDS):
+        try:
+            poll_once(interface)
+        except AirtableError as e:
+            log.error("AirtableError en poller: %s", e)
+        except Exception:
+            log.error("Excepción en poller:\n%s", traceback.format_exc())
 
 
 # Mapa prefijo → handler. on_receive hace exact match con dict.get(prefix),
@@ -1442,6 +1648,16 @@ def main() -> int:
     pub.subscribe(on_receive, "meshtastic.receive")
     pub.subscribe(on_connection, "meshtastic.connection.established")
 
+    # Hilo que notifica al portero cuando recepción resuelve una solicitud.
+    poller_stop = threading.Event()
+    poller_thread = threading.Thread(
+        target=poller_loop,
+        args=(interface, poller_stop),
+        name="resultados-poller",
+        daemon=True,
+    )
+    poller_thread.start()
+
     stop = False
 
     def _shutdown(signum, frame):  # noqa: ARG001
@@ -1457,6 +1673,8 @@ def main() -> int:
         while not stop:
             time.sleep(1)
     finally:
+        poller_stop.set()
+        poller_thread.join(timeout=2)
         try:
             interface.close()
         except Exception:

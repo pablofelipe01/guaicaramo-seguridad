@@ -193,6 +193,11 @@ class MeshtasticService extends ChangeNotifier {
   final _personRequestController = StreamController<PersonRequest>.broadcast();
   final _personResponseController = StreamController<PersonResponse>.broadcast();
   final _nodePositionController = StreamController<MeshNode>.broadcast();
+  // Resultados proactivos del gateway (RESULTADO_*): recepción resolvió una
+  // solicitud/alerta y el portero recibe el veredicto sin volver a consultar.
+  final _gatewayResultController =
+      StreamController<GatewayResultNotice>.broadcast();
+  final List<GatewayResultNotice> _gatewayResults = [];
 
   Stream<ChatMessage> get messageStream => _messageController.stream;
   Stream<VehicleRequest> get vehicleRequestStream => _vehicleRequestController.stream;
@@ -200,6 +205,26 @@ class MeshtasticService extends ChangeNotifier {
   Stream<PersonRequest> get personRequestStream => _personRequestController.stream;
   Stream<PersonResponse> get personResponseStream => _personResponseController.stream;
   Stream<MeshNode> get nodePositionStream => _nodePositionController.stream;
+  Stream<GatewayResultNotice> get gatewayResultStream =>
+      _gatewayResultController.stream;
+
+  /// Resultados push pendientes de que el portero los vea/descarte (más nuevos
+  /// al final). La UI los muestra como banner en Recepción.
+  List<GatewayResultNotice> get gatewayResults =>
+      List.unmodifiable(_gatewayResults);
+
+  /// El portero descartó (vio) un resultado push.
+  void dismissGatewayResult(GatewayResultNotice notice) {
+    _gatewayResults.remove(notice);
+    notifyListeners();
+  }
+
+  /// El portero descartó todos los resultados push.
+  void clearGatewayResults() {
+    if (_gatewayResults.isEmpty) return;
+    _gatewayResults.clear();
+    notifyListeners();
+  }
 
   List<VehicleRequest> get pendingRequests =>
       _vehicleRequests.where((r) => !r.isResponded).toList();
@@ -1094,14 +1119,16 @@ class MeshtasticService extends ChangeNotifier {
     return _sendSolicitud(message, requestId);
   }
 
-  /// `SOLICITUD_F|<reqId>|<cedula>|<comment>` → fila PENDIENTE en FinDeSemana.
+  /// `SOLICITUD_F|<reqId>|<cedula>|<nombre>|<comment>` → fila PENDIENTE en FinDeSemana.
   Future<SolicitudResult> sendSolicitudFinDeSToGateway({
     required String cedula,
+    String? nombre,
     String? comment,
   }) async {
     final requestId = _newRequestId();
+    final safeNombre = _sanitizeShort(nombre ?? '');
     final safeComment = _sanitizeComment(comment);
-    final message = 'SOLICITUD_F|$requestId|$cedula|$safeComment';
+    final message = 'SOLICITUD_F|$requestId|$cedula|$safeNombre|$safeComment';
     debugPrint('🗓️ [FINDES] SOLICITUD_F → gateway: $message');
     return _sendSolicitud(message, requestId);
   }
@@ -1563,6 +1590,24 @@ class MeshtasticService extends ChangeNotifier {
                   area: parts.length > 4 ? parts[4] : null,
                 );
                 break;
+              case 'NO_REGISTRADO':
+                result =
+                    PersonCheckResult(status: PlateCheckStatus.notRegistered);
+                break;
+              case 'SIN_AUTORIZACION':
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.registeredUnauthorized,
+                  personName: parts.length > 3 ? parts[3] : null,
+                  area: parts.length > 4 ? parts[4] : null,
+                );
+                break;
+              case 'RECHAZADO':
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.rejected,
+                  personName: parts.length > 3 ? parts[3] : null,
+                  area: parts.length > 4 ? parts[4] : null,
+                );
+                break;
               case 'NO_APROBADO':
                 result =
                     PersonCheckResult(status: PlateCheckStatus.notApproved);
@@ -1651,6 +1696,22 @@ class MeshtasticService extends ChangeNotifier {
               case 'APROBADO':
                 result = PersonCheckResult(
                   status: PlateCheckStatus.approved,
+                  personName: parts.length > 3 ? parts[3] : null,
+                );
+                break;
+              case 'NO_REGISTRADO':
+                result =
+                    PersonCheckResult(status: PlateCheckStatus.notRegistered);
+                break;
+              case 'SIN_AUTORIZACION':
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.registeredUnauthorized,
+                  personName: parts.length > 3 ? parts[3] : null,
+                );
+                break;
+              case 'RECHAZADO':
+                result = PersonCheckResult(
+                  status: PlateCheckStatus.rejected,
                   personName: parts.length > 3 ? parts[3] : null,
                 );
                 break;
@@ -1783,6 +1844,28 @@ class MeshtasticService extends ChangeNotifier {
         return;
       }
 
+      // RESULTADO_* — push proactivo del gateway: recepción resolvió una
+      // solicitud/alerta (Caso 1 o Caso 2). El portero se entera sin reconsultar.
+      // Formato: RESULTADO_P|<cedula>|<AUTORIZADO|RECHAZADO>|<nombre>
+      //          RESULTADO_V|<placa>|<...>|<conductor>
+      //          RESULTADO_F|<cedula>|<...>|<nombre>
+      if (text.startsWith('RESULTADO_P|')) {
+        _handleGatewayResult(text.split('|'), GatewayResultCategory.persona);
+        _markPacketProcessed(packetId);
+        return;
+      }
+      if (text.startsWith('RESULTADO_V|')) {
+        _handleGatewayResult(text.split('|'), GatewayResultCategory.vehiculo);
+        _markPacketProcessed(packetId);
+        return;
+      }
+      if (text.startsWith('RESULTADO_F|')) {
+        _handleGatewayResult(
+            text.split('|'), GatewayResultCategory.finDeSemana);
+        _markPacketProcessed(packetId);
+        return;
+      }
+
       // RESPUESTA del gateway a una consulta de placa.
       if (text.startsWith('RESPUESTA|')) {
         final parts = text.split('|');
@@ -1799,6 +1882,22 @@ class MeshtasticService extends ChangeNotifier {
               case 'APROBADO':
                 result = PlateCheckResult(
                   status: PlateCheckStatus.approved,
+                  driverName: parts.length > 3 ? parts[3] : null,
+                );
+                break;
+              case 'NO_REGISTRADO':
+                result =
+                    PlateCheckResult(status: PlateCheckStatus.notRegistered);
+                break;
+              case 'SIN_AUTORIZACION':
+                result = PlateCheckResult(
+                  status: PlateCheckStatus.registeredUnauthorized,
+                  driverName: parts.length > 3 ? parts[3] : null,
+                );
+                break;
+              case 'RECHAZADO':
+                result = PlateCheckResult(
+                  status: PlateCheckStatus.rejected,
                   driverName: parts.length > 3 ? parts[3] : null,
                 );
                 break;
@@ -2307,6 +2406,36 @@ class MeshtasticService extends ChangeNotifier {
     }
   }
 
+  /// Procesa un RESULTADO_* (push del gateway con el veredicto de recepción).
+  /// parts: [prefijo, key (placa/cédula), AUTORIZADO|RECHAZADO, nombre?].
+  void _handleGatewayResult(List<String> parts, GatewayResultCategory cat) {
+    if (parts.length < 3) return;
+    final key = parts[1].trim();
+    final resultStr = parts[2].trim().toUpperCase();
+    final nombre = parts.length > 3 && parts[3].trim().isNotEmpty
+        ? parts[3].trim()
+        : null;
+    final aprobado = resultStr == 'AUTORIZADO';
+    final notice = GatewayResultNotice(
+      categoria: cat,
+      key: key,
+      aprobado: aprobado,
+      nombre: nombre,
+      timestamp: DateTime.now(),
+    );
+    // Evitar duplicados si el gateway reenvía (mismo key + categoría sin ver aún).
+    _gatewayResults.removeWhere(
+      (r) => r.categoria == cat && r.key == key,
+    );
+    _gatewayResults.add(notice);
+    _gatewayResultController.add(notice);
+    debugPrint(
+      '📣 [RESULTADO] ${notice.categoriaLabel} $key → ${notice.titulo}'
+      '${nombre != null ? " ($nombre)" : ""}',
+    );
+    notifyListeners();
+  }
+
   @override
   void dispose() {
     _stopKeepalive();
@@ -2319,6 +2448,7 @@ class MeshtasticService extends ChangeNotifier {
     _personResponseController.close();
     _nodePositionController.close();
     _itemsUpdatedController.close();
+    _gatewayResultController.close();
     _client?.disconnect();
     super.dispose();
   }
