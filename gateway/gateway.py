@@ -99,6 +99,12 @@ NODEDB_DUMP_PATH = os.getenv(
 ).strip()
 NODEDB_DUMP_INTERVAL = int(os.getenv("NODEDB_DUMP_INTERVAL", "300"))  # segundos
 
+# Reconexión automática del puerto serial/radio. Si Meshtastic pierde el enlace
+# (desconexión física de USB, glitch de energía, etc.), el gateway reconstruye el
+# interface solo en vez de quedarse "vivo pero sordo" hasta un reinicio manual.
+RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))  # backoff inicial
+RECONNECT_MAX_DELAY_SECONDS = int(os.getenv("RECONNECT_MAX_DELAY_SECONDS", "60"))  # tope
+
 # ---------- Logging ----------
 
 logging.basicConfig(
@@ -1450,10 +1456,14 @@ def poll_once(interface) -> None:
     )
 
 
-def poller_loop(interface, stop_event: threading.Event) -> None:
-    """Hilo background: cada GATEWAY_POLL_SECONDS notifica resultados resueltos."""
+def poller_loop(stop_event: threading.Event) -> None:
+    """Hilo background: cada GATEWAY_POLL_SECONDS notifica resultados resueltos.
+    Lee el interface vigente del holder para tolerar reconexiones."""
     log.info("🔄 Poller de resultados activo (cada %ds).", GATEWAY_POLL_SECONDS)
     while not stop_event.wait(GATEWAY_POLL_SECONDS):
+        interface = _conn.get()
+        if interface is None:
+            continue  # radio caído / reconectando: nada que notificar todavía
         try:
             poll_once(interface)
         except AirtableError as e:
@@ -1534,15 +1544,53 @@ def on_connection(interface, topic=None) -> None:  # noqa: ARG001
         log.info("📡 Conectado al nodo Meshtastic.")
 
 
+# Holder compartido del interface vivo. Los hilos (poller, volcado de nodeDB)
+# leen SIEMPRE de aquí en vez de capturar el interface al arrancar, para que tras
+# una reconexión usen el objeto nuevo y no el muerto. La recepción de mensajes
+# entrantes no lo necesita: pubsub ya entrega el interface vigente al callback.
+class _InterfaceHolder:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._interface = None
+
+    def get(self):
+        with self._lock:
+            return self._interface
+
+    def set(self, interface) -> None:
+        with self._lock:
+            self._interface = interface
+
+
+_conn = _InterfaceHolder()
+# Lo activa meshtastic al publicar 'meshtastic.connection.lost'; el bucle
+# principal lo detecta y dispara la reconexión.
+_connection_lost = threading.Event()
+
+
+def on_connection_lost(interface=None, topic=None) -> None:  # noqa: ARG001
+    """Callback de 'meshtastic.connection.lost': marca que hay que reconectar."""
+    log.warning("📡❌ Enlace con el radio Meshtastic perdido — se reintentará reconectar.")
+    _connection_lost.set()
+
+
 # ---------- Bootstrap ----------
 
 
 def build_interface():
     """Crea el interface según las env vars."""
     if MESHTASTIC_SERIAL:
-        log.info("🔌 Abriendo Serial: %s", MESHTASTIC_SERIAL)
+        dev = MESHTASTIC_SERIAL
+        if not os.path.exists(dev):
+            # Tras una reconexión el SO puede reasignar el puerto (ttyUSB0→ttyUSB1).
+            # Si el path configurado no existe, dejamos que Meshtastic autodetecte.
+            log.warning(
+                "⚠️ %s no existe; dejando que Meshtastic autodetecte el puerto.", dev
+            )
+            dev = None
+        log.info("🔌 Abriendo Serial: %s", dev or "(autodetección)")
         from meshtastic.serial_interface import SerialInterface
-        return SerialInterface(devPath=MESHTASTIC_SERIAL)
+        return SerialInterface(devPath=dev)
     if MESHTASTIC_TCP:
         log.info("🌐 Abriendo TCP: %s", MESHTASTIC_TCP)
         from meshtastic.tcp_interface import TCPInterface
@@ -1655,6 +1703,42 @@ def dump_nodedb(interface) -> None:
         log.debug("No se pudo volcar nodeDB: %s", e)
 
 
+def reconnect_interface(old_interface, should_stop):
+    """Cierra el interface muerto y reconstruye con backoff exponencial hasta
+    lograr reconexión. Devuelve el nuevo interface, o None si se pidió parar
+    (apagado del servicio) antes de lograrlo.
+
+    Mientras dura el corte, el holder queda en None: el poller pausa y el volcado
+    de nodeDB no toca un objeto muerto."""
+    _conn.set(None)
+    try:
+        if old_interface is not None:
+            old_interface.close()
+    except Exception:
+        pass
+
+    delay = RECONNECT_DELAY_SECONDS
+    while not should_stop():
+        try:
+            new_interface = build_interface()
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "🔁 Reconexión falló (%s) — reintento en %ds.",
+                e, delay,
+            )
+            # Espera troceada en 1s para responder rápido a SIGTERM/SIGINT.
+            waited = 0
+            while waited < delay and not should_stop():
+                time.sleep(1)
+                waited += 1
+            delay = min(delay * 2, RECONNECT_MAX_DELAY_SECONDS)
+            continue
+        _conn.set(new_interface)
+        log.info("✅ Reconectado al radio Meshtastic.")
+        return new_interface
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Guaicaramo Control Gateway")
     parser.add_argument(
@@ -1680,14 +1764,16 @@ def main() -> int:
         return 1
 
     interface = build_interface()
+    _conn.set(interface)
     pub.subscribe(on_receive, "meshtastic.receive")
     pub.subscribe(on_connection, "meshtastic.connection.established")
+    pub.subscribe(on_connection_lost, "meshtastic.connection.lost")
 
     # Hilo que notifica al portero cuando recepción resuelve una solicitud.
     poller_stop = threading.Event()
     poller_thread = threading.Thread(
         target=poller_loop,
-        args=(interface, poller_stop),
+        args=(poller_stop,),
         name="resultados-poller",
         daemon=True,
     )
@@ -1709,6 +1795,14 @@ def main() -> int:
     try:
         while not stop:
             time.sleep(1)
+            if _connection_lost.is_set():
+                _connection_lost.clear()
+                new_interface = reconnect_interface(interface, lambda: stop)
+                if new_interface is not None:
+                    interface = new_interface
+                    dump_nodedb(interface)
+                    last_dump = time.time()
+                continue
             if time.time() - last_dump >= NODEDB_DUMP_INTERVAL:
                 dump_nodedb(interface)
                 last_dump = time.time()
