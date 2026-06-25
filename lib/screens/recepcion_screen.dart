@@ -111,7 +111,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   String get _cedula => _cedulaController.text.trim();
   String get _placa => _placaController.text.trim().toUpperCase();
   String get _nombre => _nombreController.text.trim();
-  String get _porteroComment => _porteroCommentController.text.trim();
 
   bool get _isVehicle => _mode == _AccessMode.vehiculo;
   bool get _isFinDeSemana => _mode == _AccessMode.finDeSemana;
@@ -219,77 +218,6 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _showSnack('Entrada registrada: $nombre');
     }
     _resetForm();
-  }
-
-  /// Envía la solicitud al gateway, que crea/actualiza una fila PENDIENTE en la
-  /// tabla maestra y responde el resultado. Muestra ese resultado al portero.
-  Future<void> _requestGatewayApproval() async {
-    if (!_service.isConnected) {
-      _showSnack('Sin conexión al nodo Meshtastic');
-      return;
-    }
-    // Caso 2: nombre y motivo de visita son obligatorios (datos incompletos →
-    // error, no se permite enviar).
-    if (_nombre.isEmpty) {
-      _showSnack(_isVehicle
-          ? 'Ingresa el nombre del conductor'
-          : 'Ingresa el nombre de la persona');
-      return;
-    }
-    if (_porteroComment.isEmpty) {
-      _showSnack('Ingresa el motivo de la visita');
-      return;
-    }
-
-    setState(() => _stage = _RecepcionStage.sendingSolicitud);
-
-    final comment = _porteroComment.isNotEmpty ? _porteroComment : null;
-    SolicitudResult result;
-    if (_isVehicle) {
-      result = await _service.sendSolicitudVehiculoToGateway(
-        cedula: _cedula,
-        placa: _placa,
-        nombre: _nombre,
-        comment: comment,
-      );
-    } else if (_isFinDeSemana) {
-      result = await _service.sendSolicitudFinDeSToGateway(
-        cedula: _cedula,
-        nombre: _nombre,
-        comment: comment,
-      );
-    } else {
-      result = await _service.sendSolicitudPersonaToGateway(
-        cedula: _cedula,
-        nombre: _nombre,
-        comment: comment,
-      );
-    }
-
-    if (!mounted) return;
-
-    setState(() {
-      switch (result) {
-        case SolicitudResult.registrada:
-          _stage = _RecepcionStage.solicitudEnviada;
-          break;
-        case SolicitudResult.rechazada:
-          _stage = _RecepcionStage.solicitudRechazada;
-          break;
-        case SolicitudResult.yaVigente:
-          _stage = _RecepcionStage.solicitudYaVigente;
-          break;
-        case SolicitudResult.timeout:
-          _stage = _RecepcionStage.error;
-          _errorMessage =
-              'El gateway no respondió a tiempo. Verifica la conexión LoRa.';
-          break;
-        case SolicitudResult.error:
-          _stage = _RecepcionStage.error;
-          _errorMessage = 'No se pudo registrar la solicitud en el gateway.';
-          break;
-      }
-    });
   }
 
   void _showSnack(String message) {
@@ -604,8 +532,9 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     }
   }
 
-  /// Caso 2 — la persona/placa NO existe en la base. Formulario de registro:
-  /// nombre + motivo de visita obligatorios → se envía a aprobación de recepción.
+  /// Caso 2 — la persona/placa NO existe en la base. El portero NO puede
+  /// registrar desde la mesh: solo se le informa que no está registrado y que
+  /// debe llamar a recepción.
   Widget _buildRegistroCard() {
     final String label;
     if (_isVehicle) {
@@ -616,78 +545,13 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       label = 'La cédula $_cedula no está registrada.';
     }
 
-    return Card(
-      color: Colors.orange.shade50,
-      elevation: 3,
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              children: [
-                const Icon(Icons.person_add_alt, color: Colors.orange, size: 32),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    _isVehicle ? 'Placa no registrada' : 'Persona no registrada',
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Text(
-              '$label Completa los datos y envía a aprobación de recepción.',
-              style: const TextStyle(fontSize: 14),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: _nombreController,
-              textCapitalization: TextCapitalization.words,
-              decoration: InputDecoration(
-                labelText: _isVehicle ? 'Nombre del conductor *' : 'Nombre *',
-                hintText: 'Nombre y apellido',
-                border: const OutlineInputBorder(),
-                prefixIcon: const Icon(Icons.person),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: _porteroCommentController,
-              minLines: 2,
-              maxLines: 3,
-              maxLength: 150,
-              textCapitalization: TextCapitalization.sentences,
-              decoration: const InputDecoration(
-                labelText: 'Motivo de visita *',
-                hintText: 'Ej: "viene a entregar paquete", '
-                    '"es proveedor de la podadora", etc.',
-                border: OutlineInputBorder(),
-                prefixIcon: Icon(Icons.edit_note),
-              ),
-            ),
-            const SizedBox(height: 16),
-            ElevatedButton.icon(
-              onPressed: _requestGatewayApproval,
-              icon: const Icon(Icons.send),
-              label: const Text('Enviar a aprobación'),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.orange,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 14),
-              ),
-            ),
-            TextButton(
-              onPressed: _resetForm,
-              child: const Text('Cancelar'),
-            ),
-          ],
-        ),
-      ),
+    return _ResultCard(
+      icon: Icons.phone_in_talk,
+      color: Colors.red,
+      title: 'NO REGISTRADO',
+      subtitle: label,
+      info: 'Esta persona no está autorizada. Llame a recepción.',
+      onReset: _resetForm,
     );
   }
 
