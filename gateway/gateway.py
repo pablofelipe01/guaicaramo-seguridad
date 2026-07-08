@@ -89,6 +89,13 @@ MESHTASTIC_BLE = os.getenv("MESHTASTIC_BLE", "").strip()         # ej: AA:BB:CC:
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("AIRTABLE_TIMEOUT", "15"))
 
+# Reintento con backoff ante 5xx/429/timeout de Airtable (solo métodos
+# idempotentes: GET y PATCH — POST no se reintenta para no duplicar filas).
+AIRTABLE_RETRIES = int(os.getenv("AIRTABLE_RETRIES", "3"))       # nº total de intentos
+AIRTABLE_RETRY_BASE = float(os.getenv("AIRTABLE_RETRY_BASE", "1"))   # backoff inicial (s)
+AIRTABLE_RETRY_MAX = float(os.getenv("AIRTABLE_RETRY_MAX", "4"))     # tope por espera (s)
+_AIRTABLE_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
 # Cada cuánto el poller revisa Airtable para notificarle al portero el resultado
 # de las solicitudes/alertas que recepción ya resolvió (aprobó o rechazó).
 GATEWAY_POLL_SECONDS = int(os.getenv("GATEWAY_POLL_SECONDS", "20"))
@@ -104,6 +111,37 @@ NODEDB_DUMP_INTERVAL = int(os.getenv("NODEDB_DUMP_INTERVAL", "300"))  # segundos
 # interface solo en vez de quedarse "vivo pero sordo" hasta un reinicio manual.
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))  # backoff inicial
 RECONNECT_MAX_DELAY_SECONDS = int(os.getenv("RECONNECT_MAX_DELAY_SECONDS", "60"))  # tope
+
+# ---------- Claude AI ("@claude" en el chat) ----------
+# Un portero puede escribir "@claude <pregunta>" como DM al nodo gateway desde la
+# pantalla Chat de la app. El gateway consulta la API de Anthropic y responde por
+# la malla con "Claude: <respuesta>". Como la app muestra cualquier texto entrante
+# que no sea del protocolo pipe como mensaje de chat, no hace falta recompilar la
+# app. Respuestas cortas (la malla tope ~237 bytes/paquete) y modelo rápido/barato
+# por defecto (Haiku 4.5); todo configurable por .env.
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5").strip()
+CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "160"))
+CLAUDE_TIMEOUT_SECONDS = float(os.getenv("CLAUDE_TIMEOUT", "30"))
+CLAUDE_SYSTEM_PROMPT = os.getenv(
+    "CLAUDE_SYSTEM_PROMPT",
+    "Eres un asistente educativo para zonas rurales de Colombia. Respondes por una "
+    "red de radio de texto con paquetes muy cortos. Responde SIEMPRE en español, de "
+    "forma breve, completa y directa, en menos de 350 caracteres. Termina siempre "
+    "con punto final.",
+)
+# Tope de bytes por paquete Meshtastic (~237 real). Dejamos margen para el prefijo
+# de paginación "[i/n] " que se antepone cuando la respuesta se parte en trozos.
+_MESH_CHUNK_BYTES = 200
+
+try:
+    import anthropic
+    _anthropic_client = (
+        anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+    )
+except ImportError:  # el SDK anthropic es opcional; sin él, @claude queda inactivo
+    anthropic = None  # type: ignore[assignment]
+    _anthropic_client = None
 
 # ---------- Logging ----------
 
@@ -136,6 +174,43 @@ def _airtable_url(table: str) -> str:
         raise AirtableError("AIRTABLE_BASE_ID no configurado")
     table_encoded = urllib.parse.quote(table)
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table_encoded}"
+
+
+def _airtable_request(method: str, url: str, **kwargs) -> "requests.Response":
+    """Llama a Airtable con reintento+backoff exponencial ante fallos transitorios
+    (HTTP 429/5xx o timeout/error de red). SOLO reintenta métodos idempotentes
+    (GET, PATCH); POST se ejecuta una sola vez para no duplicar filas.
+
+    Devuelve el Response tal cual (el caller sigue validando `status_code` y
+    lanzando AirtableError como antes). Si se agotan los reintentos por una
+    excepción de red, lanza AirtableError.
+    """
+    idempotent = method.upper() in ("GET", "PATCH")
+    delay = AIRTABLE_RETRY_BASE
+    attempts = AIRTABLE_RETRIES if idempotent else 1
+    resp = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.exceptions.RequestException as e:
+            if attempt >= attempts:
+                raise AirtableError(
+                    f"{method} {url.rsplit('/', 1)[-1]} sin respuesta tras "
+                    f"{attempt} intento(s): {e}"
+                ) from e
+            log.warning("Airtable %s intento %d falló (%s); reintento en %.0fs",
+                        method, attempt, e, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, AIRTABLE_RETRY_MAX)
+            continue
+        if resp.status_code in _AIRTABLE_RETRYABLE_STATUS and attempt < attempts:
+            log.warning("Airtable %s HTTP %d intento %d; reintento en %.0fs",
+                        method, resp.status_code, attempt, delay)
+            time.sleep(delay)
+            delay = min(delay * 2, AIRTABLE_RETRY_MAX)
+            continue
+        return resp
+    return resp  # defensivo: no debería alcanzarse
 
 
 def _now_iso() -> str:
@@ -226,7 +301,7 @@ def airtable_find_placa(placa: str) -> dict[str, Any] | None:
         "sort[0][field]": "vence",
         "sort[0][direction]": "desc",
     }
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_PLACAS_TABLE),
         headers=_airtable_headers(),
         params=params,
@@ -248,7 +323,7 @@ def airtable_find_findesemana(cedula: str) -> dict[str, Any] | None:
     cedula_clean = cedula.strip()
     formula = f"{{cedula}} = '{cedula_clean}'"
     params = {"filterByFormula": formula, "maxRecords": 1}
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_FINDESEMANA_TABLE),
         headers=_airtable_headers(),
         params=params,
@@ -279,7 +354,7 @@ def airtable_find_active_findesemana(cedula: str) -> dict[str, Any] | None:
         "sort[0][field]": "entry_time",
         "sort[0][direction]": "desc",
     }
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_REGISTROS_TABLE),
         headers=_airtable_headers(),
         params=params,
@@ -298,7 +373,7 @@ def airtable_find_persona(cedula: str) -> dict[str, Any] | None:
     cedula_clean = cedula.strip()
     formula = f"{{cedula}} = '{cedula_clean}'"
     params = {"filterByFormula": formula, "maxRecords": 1}
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_PERSONAS_TABLE),
         headers=_airtable_headers(),
         params=params,
@@ -331,7 +406,7 @@ def airtable_create_record(table: str, fields: dict[str, Any]) -> str:
 def airtable_update_record(table: str, record_id: str, fields: dict[str, Any]) -> None:
     """Actualiza una fila en cualquier tabla."""
     url = f"{_airtable_url(table)}/{record_id}"
-    resp = requests.patch(
+    resp = _airtable_request("PATCH",
         url,
         headers=_airtable_headers(),
         json={"fields": fields, "typecast": True},
@@ -346,7 +421,7 @@ def airtable_update_record(table: str, record_id: str, fields: dict[str, Any]) -
 def airtable_list(table: str, formula: str, max_records: int = 100) -> list[dict[str, Any]]:
     """Lista filas de una tabla que cumplen `formula` (filterByFormula)."""
     params = {"filterByFormula": formula, "maxRecords": max_records}
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_url(table),
         headers=_airtable_headers(),
         params=params,
@@ -377,7 +452,7 @@ def airtable_create_registro(fields: dict[str, Any]) -> str:
 
 def airtable_update_registro(record_id: str, fields: dict[str, Any]) -> None:
     url = f"{_airtable_url(AIRTABLE_REGISTROS_TABLE)}/{record_id}"
-    resp = requests.patch(
+    resp = _airtable_request("PATCH",
         url,
         headers=_airtable_headers(),
         json={"fields": fields},
@@ -406,7 +481,7 @@ def airtable_find_active_entry(placa: str) -> dict[str, Any] | None:
         "sort[0][field]": "entry_time",
         "sort[0][direction]": "desc",
     }
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_REGISTROS_TABLE),
         headers=_airtable_headers(),
         params=params,
@@ -437,7 +512,7 @@ def airtable_find_active_person(cedula: str) -> dict[str, Any] | None:
         "sort[0][field]": "entry_time",
         "sort[0][direction]": "desc",
     }
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_REGISTROS_TABLE),
         headers=_airtable_headers(),
         params=params,
@@ -466,6 +541,79 @@ def send_text(interface, destination_node: int, text: str) -> None:
         log.info("📤 → %s: %s", _node_hex(destination_node), text)
     except Exception as e:
         log.error("✗ Error enviando a %s: %s", _node_hex(destination_node), e)
+
+
+def _chunk_for_mesh(text: str, limit: int = _MESH_CHUNK_BYTES) -> list[str]:
+    """Parte `text` en trozos de <= `limit` bytes UTF-8, cortando por palabras.
+
+    Meshtastic no fragmenta automáticamente: un texto que excede el tope del
+    paquete se rechaza/trunca. Cortamos por palabra y, si una palabra sola no
+    cabe, la partimos por bytes sin romper caracteres multibyte.
+    """
+    chunks: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = word if not current else current + " " + word
+        if len(candidate.encode("utf-8")) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        while len(word.encode("utf-8")) > limit:
+            cut = word[:limit]
+            while len(cut.encode("utf-8")) > limit:
+                cut = cut[:-1]
+            chunks.append(cut)
+            word = word[len(cut):]
+        current = word
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
+def handle_claude(interface, from_num: int, text: str) -> None:
+    """Responde una consulta libre "@claude <pregunta>" con la API de Anthropic.
+
+    Lo lanza on_receive en un hilo aparte para no bloquear la recepción de otros
+    paquetes (consultas de placas, etc.) mientras la API responde.
+    """
+    # Quitar el prefijo "@claude" (case-insensitive) y espacios.
+    query = text.strip()[len("@claude"):].strip()
+    if not query:
+        send_text(interface, from_num, "Claude: escribe tu pregunta después de @claude.")
+        return
+    if _anthropic_client is None:
+        send_text(interface, from_num, "Claude: no configurado (falta ANTHROPIC_API_KEY).")
+        return
+
+    log.info("🤖 Consulta Claude de %s: %s", _node_hex(from_num or 0), query)
+    try:
+        resp = _anthropic_client.with_options(
+            timeout=CLAUDE_TIMEOUT_SECONDS
+        ).messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            system=CLAUDE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": query}],
+        )
+        answer = next(
+            (b.text for b in resp.content if b.type == "text"), ""
+        ).strip()
+    except Exception as e:
+        log.error("✗ Error consultando Claude: %s", e)
+        send_text(interface, from_num, "Claude: error al consultar. Intenta de nuevo.")
+        return
+
+    if not answer:
+        send_text(interface, from_num, "Claude: sin respuesta.")
+        return
+
+    chunks = _chunk_for_mesh("Claude: " + answer)
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        out = chunk if total == 1 else f"[{i}/{total}] {chunk}"
+        send_text(interface, from_num, out)
 
 
 def _node_hex(node_num: int) -> str:
@@ -985,7 +1133,7 @@ def airtable_list_authorized_items() -> list[dict[str, Any]]:
     """Devuelve items con autorizado=true y usado=false."""
     formula = "AND({autorizado} = TRUE(), {usado} != TRUE())"
     params = {"filterByFormula": formula, "pageSize": 100}
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_items_url(),
         headers=_airtable_headers(),
         params=params,
@@ -1001,7 +1149,7 @@ def airtable_list_authorized_items() -> list[dict[str, Any]]:
 def airtable_find_item(numero: str) -> dict[str, Any] | None:
     formula = f"{{numero}} = '{numero.strip()}'"
     params = {"filterByFormula": formula, "maxRecords": 1}
-    resp = requests.get(
+    resp = _airtable_request("GET",
         _airtable_items_url(),
         headers=_airtable_headers(),
         params=params,
@@ -1024,7 +1172,7 @@ def airtable_mark_item_used(record_id: str, from_num: int) -> None:
             "nodo_origen": _node_hex(from_num),
         }
     }
-    resp = requests.patch(
+    resp = _airtable_request("PATCH",
         url,
         headers=_airtable_headers(),
         json=body,
@@ -1524,6 +1672,17 @@ def on_receive(packet: dict[str, Any], interface) -> None:
         if my_num is not None and to_num != my_num:
             return
 
+        # Consulta libre a Claude: "@claude <pregunta>". No usa el protocolo pipe;
+        # se atiende en un hilo aparte para no bloquear la recepción de otros DMs.
+        if text.strip().lower().startswith("@claude"):
+            log.info("📨 ← %s: %s", _node_hex(from_num or 0), text)
+            threading.Thread(
+                target=handle_claude,
+                args=(interface, from_num, text),
+                daemon=True,
+            ).start()
+            return
+
         prefix = text.split("|", 1)[0]
         handler = HANDLERS.get(prefix)
         if handler is None:
@@ -1619,7 +1778,7 @@ def precheck() -> None:
     else:
         # Ping para verificar credenciales / nombre de tabla.
         try:
-            resp = requests.get(
+            resp = _airtable_request("GET",
                 _airtable_url(AIRTABLE_PLACAS_TABLE),
                 headers=_airtable_headers(),
                 params={"maxRecords": 1},
