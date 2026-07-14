@@ -930,11 +930,11 @@ class MeshtasticService extends ChangeNotifier {
   }
 
   /// Sanitiza un texto para que no rompa el split por `|` del protocolo.
-  /// Reemplaza pipes con `/` y recorta a 150 caracteres.
-  static String _sanitizeComment(String? raw) {
+  /// Reemplaza pipes con `/` y recorta a [max] caracteres.
+  static String _sanitizeComment(String? raw, {int max = 150}) {
     if (raw == null) return '';
     final cleaned = raw.replaceAll('|', '/').trim();
-    return cleaned.length > 150 ? cleaned.substring(0, 150) : cleaned;
+    return cleaned.length > max ? cleaned.substring(0, max) : cleaned;
   }
 
   /// Empaca hasta 4 acompañantes como 8 partes intercaladas (cc1|nombre1|...).
@@ -1089,18 +1089,25 @@ class MeshtasticService extends ChangeNotifier {
     return completer.future;
   }
 
-  /// `SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>` → fila PENDIENTE en Placas.
+  /// Tope del motivo de visita. El paquete mesh admite ~228 bytes y la
+  /// SOLICITUD_V ya gasta ~100 en reqId + cédula + placa + nombre + área.
+  static const int maxMotivoVisita = 100;
+
+  /// `SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>|<areaCode>` →
+  /// fila PENDIENTE en Placas. [areaCode] es el código corto del área de destino
+  /// (ver [AreaDestino]); el gateway lo expande al nombre real en Airtable.
   Future<SolicitudResult> sendSolicitudVehiculoToGateway({
     required String cedula,
     required String placa,
+    required String areaCode,
     String? nombre,
     String? comment,
   }) async {
     final requestId = _newRequestId();
     final safeNombre = _sanitizeShort(nombre ?? '');
-    final safeComment = _sanitizeComment(comment);
+    final safeComment = _sanitizeComment(comment, max: maxMotivoVisita);
     final message =
-        'SOLICITUD_V|$requestId|$cedula|$placa|$safeNombre|$safeComment';
+        'SOLICITUD_V|$requestId|$cedula|$placa|$safeNombre|$safeComment|$areaCode';
     debugPrint('🚗 [VEHICLE] SOLICITUD_V → gateway: $message');
     return _sendSolicitud(message, requestId);
   }

@@ -24,13 +24,16 @@ Escucha mensajes en la red mesh y los traduce a operaciones en Airtable:
       → inserta fila en `Registros` con la aprobación manual (status puede ser
         APROBADO, NEGADO o PENDIENTE).
 
-  SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<motivo>
+  SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<motivo>|<areaCode>
   SOLICITUD_P|<reqId>|<cedula>|<nombre>|<motivo>
   SOLICITUD_F|<reqId>|<cedula>|<nombre>|<motivo>
       → Caso 2 (visitante NO registrado): crea/actualiza una fila PENDIENTE en la
         tabla maestra (Placas / Personas / FinDeSemana) sin autorizar, guardando
         nombre, motivo de visita y nodo_origen. Nunca duplica (reusa la fila si
         ya existe). Responde RESP_SOL|<reqId>|<REGISTRADA|RECHAZADA|YA_VIGENTE|ERROR>.
+        En SOLICITUD_V, <areaCode> es un código ASCII corto (ver AREAS_DESTINO,
+        ej: BASCULA) que el gateway expande al campo `Areas Destino` de Placas.
+        Si no viene (app vieja), cae al área por defecto.
 
   RESULTADO_P|<cedula>|<AUTORIZADO|RECHAZADO>|<nombre>   (análogo: RESULTADO_V, RESULTADO_F)
       → mensaje PROACTIVO del gateway al portero (nodo_origen). Un hilo en
@@ -1329,10 +1332,31 @@ def _send_resp_sol(interface, from_num: int, request_id: str, resultado: str) ->
     send_text(interface, from_num, f"RESP_SOL|{request_id}|{resultado}")
 
 
+# El área de destino viaja por la mesh como código ASCII corto: los acentos
+# gastarían el doble de bytes del paquete y no sobreviven bien al transporte.
+# El gateway lo expande al nombre exacto de la opción en Airtable.
+AREAS_DESTINO = {
+    "BASCULA": "Báscula y almacén",
+    "ADMIN": "Administración",
+    "FONDO": "Fondo de empleados",
+    "LOGISTICA": "Logística y transporte",
+    "PLANTA": "Planta de beneficio",
+    "SIRIUS": "Sirius",
+}
+AREA_DESTINO_DEFAULT = "Báscula y almacén"
+
+
+def _area_destino(code: str) -> str:
+    """Traduce el código de área que manda la app al nombre de Airtable.
+    Un código desconocido cae al área por defecto (Báscula y almacén), que hoy
+    es la única habilitada en el formulario del portero."""
+    return AREAS_DESTINO.get(code.strip().upper(), AREA_DESTINO_DEFAULT)
+
+
 def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> None:
-    """SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>.
-    Crea/actualiza fila PENDIENTE en Placas (guardando conductor) y responde
-    RESP_SOL con el resultado."""
+    """SOLICITUD_V|<reqId>|<cedula>|<placa>|<nombre>|<comment>|<areaCode>.
+    Crea/actualiza fila PENDIENTE en Placas (guardando conductor, motivo de
+    visita y área de destino) y responde RESP_SOL con el resultado."""
     if len(parts) < 4:
         log.warning("SOLICITUD_V formato inválido: %s", parts)
         return
@@ -1341,9 +1365,11 @@ def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> Non
     placa = parts[3].upper().strip()
     nombre = parts[4].strip() if len(parts) > 4 else ""
     comment = parts[5] if len(parts) > 5 else ""
+    # Apps viejas no mandan el área → cae al default (Báscula y almacén).
+    area = _area_destino(parts[6] if len(parts) > 6 else "")
     log.info(
-        "🚗 SOLICITUD_V req=%s placa=%s cedula=%s conductor=%s de %s",
-        request_id, placa, cedula, nombre or "—", _node_hex(from_num),
+        "🚗 SOLICITUD_V req=%s placa=%s cedula=%s conductor=%s area=%s de %s",
+        request_id, placa, cedula, nombre or "—", area, _node_hex(from_num),
     )
 
     try:
@@ -1357,6 +1383,7 @@ def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> Non
                 "estado": "PENDIENTE",
                 "notas": comment,
                 "motivo_visita": comment,
+                "Areas Destino": area,
                 "nodo_origen": node,
                 "resultado_notificado": False,
             }
@@ -1381,6 +1408,7 @@ def handle_solicitud_vehiculo(interface, from_num: int, parts: list[str]) -> Non
             "estado": "PENDIENTE",
             "nodo_origen": node,
             "resultado_notificado": False,
+            "Areas Destino": area,
         }
         if comment:
             update["motivo_visita"] = comment

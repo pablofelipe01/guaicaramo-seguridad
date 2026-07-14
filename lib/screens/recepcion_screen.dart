@@ -46,6 +46,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
 
   _AccessMode _mode = _AccessMode.vehiculo;
   _RecepcionStage _stage = _RecepcionStage.idle;
+  AreaDestino _areaDestino = AreaDestino.defaultArea;
 
   PlateCheckResult? _lastPlateCheck;
   PersonCheckResult? _lastPersonCheck;
@@ -101,6 +102,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _lastPlateCheck = null;
       _lastPersonCheck = null;
       _errorMessage = null;
+      _areaDestino = AreaDestino.defaultArea;
       _cedulaController.clear();
       _placaController.clear();
       _nombreController.clear();
@@ -111,6 +113,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
   String get _cedula => _cedulaController.text.trim();
   String get _placa => _placaController.text.trim().toUpperCase();
   String get _nombre => _nombreController.text.trim();
+  String get _porteroComment => _porteroCommentController.text.trim();
 
   bool get _isVehicle => _mode == _AccessMode.vehiculo;
   bool get _isFinDeSemana => _mode == _AccessMode.finDeSemana;
@@ -218,6 +221,54 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
       _showSnack('Entrada registrada: $nombre');
     }
     _resetForm();
+  }
+
+  /// Caso 2 (solo vehículos) — el conductor no existe en Placas. Envía la
+  /// SOLICITUD_V al gateway, que crea la fila PENDIENTE con el motivo y el área
+  /// de destino, y responde el resultado.
+  Future<void> _registrarConductor() async {
+    if (!_service.isConnected) {
+      _showSnack('Sin conexión al nodo Meshtastic');
+      return;
+    }
+    if (_nombre.isEmpty) {
+      _showSnack('Nombre es requerido');
+      return;
+    }
+    if (_porteroComment.length < 5) {
+      _showSnack('Descripción requerida (mín 5 caracteres)');
+      return;
+    }
+
+    setState(() => _stage = _RecepcionStage.sendingSolicitud);
+
+    final result = await _service.sendSolicitudVehiculoToGateway(
+      cedula: _cedula,
+      placa: _placa,
+      areaCode: _areaDestino.code,
+      nombre: _nombre,
+      comment: _porteroComment,
+    );
+
+    if (!mounted) return;
+
+    setState(() {
+      switch (result) {
+        case SolicitudResult.registrada:
+          _stage = _RecepcionStage.solicitudEnviada;
+        case SolicitudResult.rechazada:
+          _stage = _RecepcionStage.solicitudRechazada;
+        case SolicitudResult.yaVigente:
+          _stage = _RecepcionStage.solicitudYaVigente;
+        case SolicitudResult.timeout:
+          _stage = _RecepcionStage.error;
+          _errorMessage =
+              'El gateway no respondió a tiempo. Verifica la conexión LoRa.';
+        case SolicitudResult.error:
+          _stage = _RecepcionStage.error;
+          _errorMessage = 'No se pudo registrar la solicitud en el gateway.';
+      }
+    });
   }
 
   void _showSnack(String message) {
@@ -532,26 +583,156 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     }
   }
 
-  /// Caso 2 — la persona/placa NO existe en la base. El portero NO puede
-  /// registrar desde la mesh: solo se le informa que no está registrado y que
-  /// debe llamar a recepción.
+  /// Caso 2 — no existe en la base.
+  ///
+  /// En vehículos el portero SÍ puede registrar al conductor: formulario rápido
+  /// (placa y cédula fijas, nombre + motivo de visita + área de destino) que
+  /// crea la fila PENDIENTE en Placas. En persona y fin de semana no hay
+  /// registro desde la mesh: solo se le dice que llame a recepción.
   Widget _buildRegistroCard() {
-    final String label;
-    if (_isVehicle) {
-      label = 'La placa $_placa no está registrada.';
-    } else if (_isFinDeSemana) {
-      label = 'La cédula $_cedula no está en la lista de fin de semana.';
-    } else {
-      label = 'La cédula $_cedula no está registrada.';
+    if (!_isVehicle) {
+      final label = _isFinDeSemana
+          ? 'La cédula $_cedula no está en la lista de fin de semana.'
+          : 'La cédula $_cedula no está registrada.';
+      return _ResultCard(
+        icon: Icons.phone_in_talk,
+        color: Colors.red,
+        title: 'NO REGISTRADO',
+        subtitle: label,
+        info: 'Esta persona no está autorizada. Llame a recepción.',
+        onReset: _resetForm,
+      );
     }
 
-    return _ResultCard(
-      icon: Icons.phone_in_talk,
-      color: Colors.red,
-      title: 'NO REGISTRADO',
-      subtitle: label,
-      info: 'Esta persona no está autorizada. Llame a recepción.',
-      onReset: _resetForm,
+    return Card(
+      color: Colors.orange.shade50,
+      elevation: 3,
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.person_add_alt, color: Colors.orange, size: 32),
+                const SizedBox(width: 12),
+                const Expanded(
+                  child: Text(
+                    'Conductor no registrado',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'La placa $_placa no está registrada. Completa los datos y envía '
+              'a aprobación de recepción.',
+              style: const TextStyle(fontSize: 14),
+            ),
+            const SizedBox(height: 16),
+            // Placa y cédula vienen de la consulta: se muestran, no se editan.
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.orange.shade200),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.directions_car, size: 18, color: Colors.grey),
+                  const SizedBox(width: 8),
+                  Text(
+                    _placa,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  const Icon(Icons.badge, size: 18, color: Colors.grey),
+                  const SizedBox(width: 8),
+                  Text('CC $_cedula', style: const TextStyle(fontSize: 15)),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _nombreController,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(
+                labelText: 'Nombre completo *',
+                hintText: 'Nombre y apellido del conductor',
+                border: OutlineInputBorder(),
+                filled: true,
+                fillColor: Colors.white,
+                prefixIcon: Icon(Icons.person),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _porteroCommentController,
+              minLines: 2,
+              maxLines: 3,
+              maxLength: MeshtasticService.maxMotivoVisita,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: const InputDecoration(
+                labelText: '¿Para dónde se dirige? *',
+                hintText: 'Ej: "entrega de insumos en almacén"',
+                border: OutlineInputBorder(),
+                filled: true,
+                fillColor: Colors.white,
+                prefixIcon: Icon(Icons.edit_note),
+              ),
+            ),
+            DropdownButtonFormField<AreaDestino>(
+              initialValue: _areaDestino,
+              decoration: const InputDecoration(
+                labelText: 'Área de destino *',
+                border: OutlineInputBorder(),
+                filled: true,
+                fillColor: Colors.white,
+                prefixIcon: Icon(Icons.place),
+              ),
+              // Las áreas deshabilitadas se ven en la lista (grises) pero no se
+              // pueden elegir: hoy el portero solo registra báscula y almacén.
+              items: [
+                for (final area in AreaDestino.values)
+                  DropdownMenuItem(
+                    value: area,
+                    enabled: area.enabled,
+                    child: Text(
+                      area.label,
+                      style: TextStyle(
+                        color: area.enabled ? null : Colors.grey.shade400,
+                      ),
+                    ),
+                  ),
+              ],
+              onChanged: (area) {
+                if (area == null || !area.enabled) return;
+                setState(() => _areaDestino = area);
+              },
+            ),
+            const SizedBox(height: 16),
+            ElevatedButton.icon(
+              onPressed: _registrarConductor,
+              icon: const Icon(Icons.send),
+              label: const Text('REGISTRAR'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.orange,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+            ),
+            TextButton(
+              onPressed: _resetForm,
+              child: const Text('Cancelar'),
+            ),
+          ],
+        ),
+      ),
     );
   }
 

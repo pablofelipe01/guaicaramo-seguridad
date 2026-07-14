@@ -390,6 +390,36 @@ class GatewayResultNotice {
   }
 }
 
+/// Área de destino de un visitante (campo `Areas Destino` de la tabla Placas).
+///
+/// Por la mesh viaja el [code] ASCII, no el rótulo: los acentos gastan el doble
+/// de bytes del paquete. El gateway lo expande al nombre exacto de Airtable.
+///
+/// Hoy el portero solo puede registrar visitantes que van a báscula y almacén;
+/// las demás áreas aparecen en el desplegable pero deshabilitadas ([enabled]).
+enum AreaDestino {
+  bascula('BASCULA', 'Báscula y almacén', enabled: true),
+  administracion('ADMIN', 'Administración'),
+  fondoEmpleados('FONDO', 'Fondo de empleados'),
+  logistica('LOGISTICA', 'Logística y transporte'),
+  plantaBeneficio('PLANTA', 'Planta de beneficio'),
+  sirius('SIRIUS', 'Sirius');
+
+  const AreaDestino(this.code, this.label, {this.enabled = false});
+
+  /// Código corto que viaja por la mesh.
+  final String code;
+
+  /// Rótulo que ve el vigilante (y nombre real del valor en Airtable).
+  final String label;
+
+  /// Si el vigilante puede seleccionarla desde la portería.
+  final bool enabled;
+
+  /// Área preseleccionada en el formulario de registro.
+  static const AreaDestino defaultArea = AreaDestino.bascula;
+}
+
 /// Resultado de una SOLICITUD_* al gateway (visitante no registrado).
 /// El gateway responde `RESP_SOL|<reqId>|<resultado>`.
 enum SolicitudResult {
