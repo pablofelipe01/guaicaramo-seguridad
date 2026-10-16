@@ -458,7 +458,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 ),
                 SizedBox(height: 4),
                 Text(
-                  'Esperando respuesta de Airtable.',
+                  'La red puede tardar hasta un minuto. No repita la consulta.',
                   style: TextStyle(fontSize: 13, color: Colors.grey),
                 ),
               ],

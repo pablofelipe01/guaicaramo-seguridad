@@ -154,6 +154,43 @@ class MeshtasticService extends ChangeNotifier {
     return '${DateTime.now().millisecondsSinceEpoch}-$_requestSeq';
   }
 
+  /// Cuánto se espera la respuesta del gateway. Con la portería a 1 salto
+  /// (vía repetidor) cada tramo de la malla tarda 4–25 s, así que una
+  /// consulta sana puede tardar ~30 s ida y vuelta (medido 2026-10-16).
+  static const Duration gatewayReplyTimeout = Duration(seconds: 75);
+
+  /// Tras el timeout, cuánto tiempo más se recuerda una consulta para
+  /// rescatar su respuesta tardía (ver [_takePendingCheck]).
+  static const Duration _lateReplyGrace = Duration(minutes: 3);
+
+  /// requestId → clave de la consulta (`V|cedula|placa`, `P|cedula`,
+  /// `F|cedula`). Permite que la respuesta tardía de una consulta expirada
+  /// resuelva el reintento de la misma consulta en vez de descartarse.
+  final Map<String, String> _checkKeyByReq = {};
+
+  void _trackCheck(String requestId, String key) {
+    _checkKeyByReq[requestId] = key;
+    Future.delayed(gatewayReplyTimeout + _lateReplyGrace,
+        () => _checkKeyByReq.remove(requestId));
+  }
+
+  /// Saca el Completer pendiente de [requestId]. Si ya expiró, devuelve el
+  /// de un reintento de la misma consulta que siga esperando (o null).
+  Completer<T>? _takePendingCheck<T>(
+      Map<String, Completer<T>> pending, String requestId) {
+    final key = _checkKeyByReq.remove(requestId);
+    final direct = pending.remove(requestId);
+    if (direct != null || key == null) return direct;
+    for (final e in _checkKeyByReq.entries) {
+      if (e.value == key && pending.containsKey(e.key)) {
+        debugPrint('🕐 Respuesta tardía $requestId resuelve el reintento ${e.key}');
+        _checkKeyByReq.remove(e.key);
+        return pending.remove(e.key);
+      }
+    }
+    return null;
+  }
+
   // ---------- Items (órdenes de salida) ----------
 
   /// Items conocidos, indexed por numero. Persiste localmente para no perder
@@ -892,7 +929,7 @@ class MeshtasticService extends ChangeNotifier {
   Future<PlateCheckResult> checkPlateWithGateway({
     required String cedula,
     required String placa,
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = gatewayReplyTimeout,
   }) async {
     if (!isConnected || _client == null) {
       return PlateCheckResult(
@@ -904,6 +941,7 @@ class MeshtasticService extends ChangeNotifier {
     final requestId = _newRequestId();
     final completer = Completer<PlateCheckResult>();
     _pendingPlateChecks[requestId] = completer;
+    _trackCheck(requestId, 'V|$cedula|$placa');
 
     final message = 'CONSULTA|$requestId|$cedula|$placa';
     debugPrint('🚗 [VEHICLE] CONSULTA → gateway: $message');
@@ -1064,7 +1102,7 @@ class MeshtasticService extends ChangeNotifier {
   Future<SolicitudResult> _sendSolicitud(
     String message,
     String requestId, {
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = gatewayReplyTimeout,
   }) async {
     if (!isConnected || _client == null) return SolicitudResult.error;
 
@@ -1146,7 +1184,7 @@ class MeshtasticService extends ChangeNotifier {
   /// Envía `CONSULTA_P|<requestId>|<cedula>` y espera `RESPUESTA_P|...`.
   Future<PersonCheckResult> checkPersonWithGateway({
     required String cedula,
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = gatewayReplyTimeout,
   }) async {
     if (!isConnected || _client == null) {
       return PersonCheckResult(
@@ -1159,6 +1197,7 @@ class MeshtasticService extends ChangeNotifier {
     final completer = Completer<PersonCheckResult>();
     _pendingPersonChecks[requestId] = completer;
 
+    _trackCheck(requestId, 'P|$cedula');
     final message = 'CONSULTA_P|$requestId|$cedula';
     debugPrint('🚶 [PERSON] CONSULTA_P → gateway: $message');
     final sent =
@@ -1190,7 +1229,7 @@ class MeshtasticService extends ChangeNotifier {
   /// Reusa [PersonCheckResult] — el nombre y area vienen en la respuesta.
   Future<PersonCheckResult> checkFinDeSWithGateway({
     required String cedula,
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = gatewayReplyTimeout,
   }) async {
     if (!isConnected || _client == null) {
       return PersonCheckResult(
@@ -1203,6 +1242,7 @@ class MeshtasticService extends ChangeNotifier {
     final completer = Completer<PersonCheckResult>();
     _pendingPersonChecks[requestId] = completer;
 
+    _trackCheck(requestId, 'F|$cedula');
     final message = 'CONSULTA_F|$requestId|$cedula';
     debugPrint('🗓️ [FINDES] CONSULTA_F → gateway: $message');
     final sent =
@@ -1583,7 +1623,8 @@ class MeshtasticService extends ChangeNotifier {
         if (parts.length >= 3) {
           final requestId = parts[1];
           final statusStr = parts[2];
-          final completer = _pendingPersonChecks.remove(requestId);
+          final completer =
+              _takePendingCheck(_pendingPersonChecks, requestId);
           debugPrint(
             '🗓️ [FINDES] RESPUESTA_F $requestId → $statusStr',
           );
@@ -1693,7 +1734,8 @@ class MeshtasticService extends ChangeNotifier {
         if (parts.length >= 3) {
           final requestId = parts[1];
           final statusStr = parts[2];
-          final completer = _pendingPersonChecks.remove(requestId);
+          final completer =
+              _takePendingCheck(_pendingPersonChecks, requestId);
           debugPrint(
             '🚶 [PERSON] RESPUESTA_P $requestId → $statusStr (pendiente: ${completer != null})',
           );
@@ -1879,7 +1921,8 @@ class MeshtasticService extends ChangeNotifier {
         if (parts.length >= 3) {
           final requestId = parts[1];
           final statusStr = parts[2];
-          final completer = _pendingPlateChecks.remove(requestId);
+          final completer =
+              _takePendingCheck(_pendingPlateChecks, requestId);
           debugPrint(
             '🚗 [VEHICLE] RESPUESTA $requestId → $statusStr (pendiente: ${completer != null})',
           );
@@ -2172,7 +2215,7 @@ class MeshtasticService extends ChangeNotifier {
   /// si existen. Mucho más confiable sobre LoRa que la lista completa.
   Future<ItemCheckResult> consultItemWithGateway({
     required String numero,
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = gatewayReplyTimeout,
   }) async {
     if (!isConnected || _client == null) {
       return ItemCheckResult(
