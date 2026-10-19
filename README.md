@@ -21,6 +21,13 @@ con internet.
    con su posición GPS y track de sesión. Tap en un nodo abre DM con él.
 4. **Solicitudes** — vista de supervisor para aprobar/negar/poner pendiente
    solicitudes de aprobación manual.
+5. **Gerentes UEA (con o sin internet)** — ingreso y salida de Gerentes de
+   Unidades Externas. Es el único módulo que **no usa la malla ni el gateway**:
+   habla directo con Airtable por HTTPS cuando el teléfono tiene internet (WiFi
+   o datos). La lista de gerentes y quién está dentro quedan guardados en el
+   teléfono; sin internet el vigilante sigue registrando y cada movimiento
+   queda en cola con su hora real hasta que vuelva la conexión. Ver
+   [Gerentes UEA](#gerentes-uea).
 
 ---
 
@@ -175,9 +182,55 @@ Todos los mensajes son texto plano sobre `TEXT_MESSAGE_APP`.
 | `vehicle_requests`         | JSON array de `VehicleRequest` (cap diario)    |
 | `message_history`          | JSON array de `ChatMessage` (cap 100)          |
 | `last_session_date`        | YYYY-MM-DD; al cambiar, limpia datos no activos |
+| `gerentes_airtable_token`  | Token de Airtable del módulo Gerentes (solo en el teléfono) |
+| `openai_api_key`           | Clave de OpenAI para el dictado de observaciones (solo en el teléfono) |
+| `gerentes_lista_v2`        | Lista de gerentes UEA + fecha de actualización  |
+| `gerentes_visitas_v2`      | Ingresos/salidas de gerentes con estado de sync. Lo pendiente nunca se borra; lo sincronizado y cerrado se conserva 7 días |
 
 Las posiciones GPS y nodos conocidos **no** se persisten — se reconstruyen
 desde la mesh en cada sesión.
+
+---
+
+## Gerentes UEA
+
+Módulo independiente (`lib/models/gerentes_models.dart`,
+`lib/services/gerentes_service.dart`, `lib/services/gerentes_airtable.dart`,
+`lib/screens/gerentes_screen.dart`). No toca la malla, el gateway ni los demás
+módulos; solo se conecta a la app como una pestaña más.
+
+**Tablas** (base `apptwIqTras1uPNOc`, accedidas por ID de tabla y de campo, así
+que renombrar columnas no rompe la app):
+
+- `Gerentes Unidades Externas` — se descarga completa al teléfono.
+- `Ingresos Gerentes Unidades Externas` — una fila por visita: `Gerente`
+  (vínculo), `fecha_hora_ingreso`, `fecha_hora_salida`, `placa_ingreso`,
+  `nota_vigilante`. Las búsquedas usan los nombres `fecha_hora_ingreso` /
+  `fecha_hora_salida`: si se renombran, la app avisa "cambió la estructura".
+
+**Configuración (una vez por teléfono, con internet):** pestaña Gtes → ícono de
+llave → pegar el token → *Guardar y probar*. Use un Personal Access Token
+dedicado con scopes `data.records:read` + `data.records:write` y acceso solo a
+la base de Guaicaramo. El token **no va dentro del APK** (los APK se comparten
+por WhatsApp/Drive); queda solo en el almacenamiento privado del teléfono.
+
+**Sincronización:** cada registro intenta subir de inmediato; si no hay
+internet queda en cola y se reintenta solo (15 s → 30 s → cada minuto), al
+volver a la app y con el botón *Sincronizar*. Con internet, cada 2 min se
+refresca quién está dentro (incluidas otras porterías) y cada 30 min la lista
+de gerentes. Reintentar no duplica: si un envío quedó sin respuesta, antes de
+repetirlo se busca en Airtable la fila por gerente + hora exacta.
+
+**Dictado de observaciones:** el micrófono del campo *Observación* (ingreso y
+salida) graba en mono a 16 kHz (máx. 90 s, ~4 KB/s) y transcribe en español
+con la API de OpenAI (`gpt-transcribe`; si la cuenta no tiene acceso, usa
+`gpt-4o-mini-transcribe`). El texto se agrega al campo para que el vigilante lo
+revise antes de registrar. **Necesita internet**: sin conexión el micrófono lo
+avisa y la observación se escribe a mano. La clave de OpenAI se configura en
+Gtes → ⚙ → *Dictado por voz (OpenAI)* o al tocar el micrófono por primera vez;
+se valida con medio segundo de silencio y queda solo en el teléfono (use una
+clave de proyecto con límite de gasto). El audio se envía a OpenAI y se borra
+del teléfono al terminar.
 
 ---
 

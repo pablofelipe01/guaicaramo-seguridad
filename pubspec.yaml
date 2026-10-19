@@ -1,7 +1,7 @@
 name: guaicaramo_control
 description: "Aplicación de control para la red mesh Meshtastic de Guaicaramo (chat, mapa, recepción de vehículos)."
 publish_to: 'none'
-version: 0.11.1+18
+version: 0.12.0+21
 
 environment:
   sdk: ^3.10.7
@@ -15,6 +15,11 @@ dependencies:
     path: packages/meshtastic_flutter
   shared_preferences: ^2.2.2
   permission_handler: ^12.0.1
+
+  # Módulo Gerentes UEA: sincroniza directo con Airtable por HTTPS (sin gateway)
+  # y graba el dictado de observaciones (transcripción con OpenAI).
+  http: ^1.6.0
+  record: ^7.1.2
 
   # Servicio en primer plano: mantiene viva la conexión BLE con la pantalla
   # apagada (evita que Android suspenda la app y mate el Bluetooth).
