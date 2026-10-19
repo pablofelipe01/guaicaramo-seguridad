@@ -20,8 +20,9 @@ Escucha mensajes en la red mesh y los traduce a operaciones en Airtable:
         REG_OK|<regId> o REG_ERR|<regId>; un reenvío del mismo regId no duplica
         la fila. Igual para REGISTRO_MANUAL / _P / _F.
 
-  SALIDA_V|<placa>
+  SALIDA_V|<placa>                  (análogo: SALIDA_P|<cedula>, SALIDA_F|<cedula>)
       → busca el último registro de la placa con salida vacía y le pone exit_time.
+        Con `#<regId>` al final (app >= 0.13.0) se confirma igual que ENTRADA_*.
 
   REGISTRO_MANUAL|<status>|<cedula>|<placa>|<supervisor>|<comment>
       → inserta fila en `Registros` con la aprobación manual (status puede ser
@@ -887,11 +888,11 @@ def handle_entrada(interface, from_num: int, parts: list[str]) -> bool:
         return False
 
 
-def handle_salida(interface, from_num: int, parts: list[str]) -> None:
+def handle_salida(interface, from_num: int, parts: list[str]) -> bool:
     """SALIDA_V|<placa>."""
     if len(parts) < 2:
         log.warning("SALIDA_V formato inválido: %s", parts)
-        return
+        return False
     placa = parts[1].upper()
     log.info("🚪 SALIDA_V placa=%s", placa)
 
@@ -909,13 +910,16 @@ def handle_salida(interface, from_num: int, parts: list[str]) -> None:
                     "status": "SALIDA_SIN_ENTRADA",
                 }
             )
-            return
+            return True
         airtable_update_registro(record["id"], {"exit_time": _now_iso()})
         log.info("✓ Salida actualizada (record %s)", record["id"])
+        return True
     except AirtableError as e:
         log.error("AirtableError en SALIDA_V: %s", e)
+        return False
     except Exception:
         log.error("Excepción en SALIDA_V:\n%s", traceback.format_exc())
+        return False
 
 
 def handle_registro_manual(interface, from_num: int, parts: list[str]) -> bool:
@@ -1050,11 +1054,11 @@ def handle_entrada_persona(interface, from_num: int, parts: list[str]) -> bool:
         return False
 
 
-def handle_salida_persona(interface, from_num: int, parts: list[str]) -> None:
+def handle_salida_persona(interface, from_num: int, parts: list[str]) -> bool:
     """SALIDA_P|<cedula>."""
     if len(parts) < 2:
         log.warning("SALIDA_P formato inválido: %s", parts)
-        return
+        return False
     cedula = parts[1]
     log.info("🚪 SALIDA_P cedula=%s", cedula)
 
@@ -1072,13 +1076,16 @@ def handle_salida_persona(interface, from_num: int, parts: list[str]) -> None:
                     "status": "SALIDA_SIN_ENTRADA",
                 }
             )
-            return
+            return True
         airtable_update_registro(record["id"], {"exit_time": _now_iso()})
         log.info("✓ Salida peatonal actualizada (record %s)", record["id"])
+        return True
     except AirtableError as e:
         log.error("AirtableError en SALIDA_P: %s", e)
+        return False
     except Exception:
         log.error("Excepción en SALIDA_P:\n%s", traceback.format_exc())
+        return False
 
 
 def handle_registro_manual_persona(interface, from_num: int, parts: list[str]) -> bool:
@@ -1209,11 +1216,11 @@ def handle_entrada_findesemana(interface, from_num: int, parts: list[str]) -> bo
         return False
 
 
-def handle_salida_findesemana(interface, from_num: int, parts: list[str]) -> None:
+def handle_salida_findesemana(interface, from_num: int, parts: list[str]) -> bool:
     """SALIDA_F|<cedula>."""
     if len(parts) < 2:
         log.warning("SALIDA_F formato inválido: %s", parts)
-        return
+        return False
     cedula = parts[1]
     log.info("🚪 SALIDA_F cedula=%s", cedula)
 
@@ -1231,13 +1238,16 @@ def handle_salida_findesemana(interface, from_num: int, parts: list[str]) -> Non
                     "status": "SALIDA_SIN_ENTRADA",
                 }
             )
-            return
+            return True
         airtable_update_registro(record["id"], {"exit_time": _now_iso()})
         log.info("✓ Salida fin-de-semana actualizada (record %s)", record["id"])
+        return True
     except AirtableError as e:
         log.error("AirtableError en SALIDA_F: %s", e)
+        return False
     except Exception:
         log.error("Excepción en SALIDA_F:\n%s", traceback.format_exc())
+        return False
 
 
 def handle_registro_manual_findesemana(interface, from_num: int, parts: list[str]) -> bool:
@@ -1828,7 +1838,7 @@ HANDLERS = {
 
 # ---------- Confirmación de registros (REG_OK / REG_ERR) ----------
 #
-# Las entradas eran "dispara y olvida": si el mensaje se perdía en la malla, el
+# Las entradas y salidas eran "dispara y olvida": si el mensaje se perdía en la malla, el
 # portero veía "Entrada registrada" pero en Airtable no quedaba nada (2026-10-19).
 # Desde la app 0.12.0 estos mensajes traen al final `#<regId>`; el gateway
 # contesta REG_OK|<regId> (fila creada) o REG_ERR|<regId> (no se pudo) y la app
@@ -1837,6 +1847,7 @@ HANDLERS = {
 _CONFIRMED_PREFIXES = frozenset({
     "ENTRADA_V", "ENTRADA_P", "ENTRADA_F",
     "REGISTRO_MANUAL", "REGISTRO_MANUAL_P", "REGISTRO_MANUAL_F",
+    "SALIDA_V", "SALIDA_P", "SALIDA_F",
 })
 _REG_ID_RE = re.compile(r"#([A-Za-z0-9-]{4,32})")
 _REG_DONE_TTL_SECONDS = 6 * 3600

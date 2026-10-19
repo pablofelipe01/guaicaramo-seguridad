@@ -194,7 +194,7 @@ class MeshtasticService extends ChangeNotifier {
 
   // ---------- Registros con confirmación (REG_OK / REG_ERR) ----------
   //
-  // Las entradas se enviaban una sola vez y sin confirmación: si el mensaje se
+  // Las entradas y salidas se enviaban una sola vez y sin confirmación: si el mensaje se
   // perdía en la malla, el portero veía "Entrada registrada" pero en Airtable
   // no quedaba nada (2026-10-19). Ahora llevan `|#<regId>` y el gateway responde
   // REG_OK|<regId> (creada) o REG_ERR|<regId> (Airtable falló). Sin respuesta se
@@ -1494,7 +1494,7 @@ class MeshtasticService extends ChangeNotifier {
   Future<bool> sendFinDeSExitToGateway({required String cedula}) async {
     final message = 'SALIDA_F|$cedula';
     debugPrint('🗓️ [FINDES] SALIDA_F → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Salida fin de semana CC $cedula');
   }
 
   /// `REGISTRO_MANUAL_F|<status>|<cedula>|<supervisor>|<comment>` al gateway.
@@ -1604,7 +1604,7 @@ class MeshtasticService extends ChangeNotifier {
   Future<bool> sendPersonExitToGateway({required String cedula}) async {
     final message = 'SALIDA_P|$cedula';
     debugPrint('🚶 [PERSON] SALIDA_P → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Salida peatón CC $cedula');
   }
 
   /// `REGISTRO_MANUAL_P|<status>|<cedula>|<supervisor>|<comment>` al gateway.
@@ -1657,7 +1657,7 @@ class MeshtasticService extends ChangeNotifier {
   /// Envía `SALIDA_V|<placa>` al gateway. TODO Fase 3 (lógica completa).
   Future<bool> sendVehicleExitToGateway({required String placa}) async {
     final message = 'SALIDA_V|$placa';
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Salida vehículo $placa');
   }
 
   // ---------- Manejo de paquetes ----------

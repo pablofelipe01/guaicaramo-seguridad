@@ -279,7 +279,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     final sent = await _service.sendVehicleExitToGateway(placa: entry.placa);
     if (sent) {
       _service.markVehicleExited(entry.placa);
-      _showSnack('Salida registrada: ${entry.placa}');
+      _showSnack('Salida registrada: ${entry.placa} — enviando al sistema…');
     } else {
       _showSnack('Error al registrar salida');
     }
@@ -289,7 +289,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     final sent = await _service.sendPersonExitToGateway(cedula: entry.cedula);
     if (sent) {
       _service.markPersonExited(entry.cedula);
-      _showSnack('Salida registrada: ${entry.nombre}');
+      _showSnack('Salida registrada: ${entry.nombre} — enviando al sistema…');
     } else {
       _showSnack('Error al registrar salida');
     }

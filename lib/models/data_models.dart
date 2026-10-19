@@ -810,7 +810,7 @@ class ChatDestination {
 /// Estado de un registro (entrada) enviado al gateway que espera `REG_OK`.
 enum RegistroEnvioEstado { enviando, fallido }
 
-/// Entrada enviada al gateway que todavía no tiene confirmación `REG_OK`.
+/// Entrada o salida enviada al gateway que todavía no tiene confirmación `REG_OK`.
 ///
 /// El gateway confirma cada registro con `REG_OK|<regId>` (o `REG_ERR|<regId>`
 /// si Airtable falló). Mientras no llegue, la app reintenta; si se agotan los
