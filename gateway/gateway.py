@@ -64,6 +64,8 @@ from typing import Any
 
 import requests
 
+import mesh_probe_tx
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # python-dotenv es opcional
@@ -114,6 +116,9 @@ NODEDB_DUMP_INTERVAL = int(os.getenv("NODEDB_DUMP_INTERVAL", "300"))  # segundos
 # interface solo en vez de quedarse "vivo pero sordo" hasta un reinicio manual.
 RECONNECT_DELAY_SECONDS = int(os.getenv("RECONNECT_DELAY_SECONDS", "5"))  # backoff inicial
 RECONNECT_MAX_DELAY_SECONDS = int(os.getenv("RECONNECT_MAX_DELAY_SECONDS", "60"))  # tope
+# Tras un glitch de USB el puerto tarda ~1s en volver a aparecer (udev). Esperamos
+# a que reaparezca en lugar de dejar que Meshtastic autodetecte: ver build_interface().
+SERIAL_WAIT_SECONDS = int(os.getenv("SERIAL_WAIT_SECONDS", "30"))
 
 # ---------- Claude AI ("@claude" en el chat) ----------
 # Un portero puede escribir "@claude <pregunta>" como DM al nodo gateway desde la
@@ -322,10 +327,23 @@ def airtable_find_placa(placa: str) -> dict[str, Any] | None:
 
 
 def airtable_find_findesemana(cedula: str) -> dict[str, Any] | None:
-    """Busca una cédula exacta en la tabla FinDeSemana."""
+    """Busca una cédula exacta en la tabla FinDeSemana.
+
+    Una cédula puede tener VARIAS filas (una por fin de semana). Aquí el gate
+    NO es `vence`/`autorizado` (no existen en esta tabla) sino `estado`: vacío
+    (fila histórica) o AUTORIZADO → vale. Preferimos una fila utilizable, de la
+    más reciente a la más vieja; si ninguna lo es, devolvemos la más reciente
+    para que el handler reporte PENDIENTE/RECHAZADO. Antes se pedía maxRecords=1
+    sin orden y Airtable podía devolver una fila vieja PENDIENTE/RECHAZADA
+    aunque existiera otra AUTORIZADA → rechazo indebido.
+    """
     cedula_clean = cedula.strip()
     formula = f"{{cedula}} = '{cedula_clean}'"
-    params = {"filterByFormula": formula, "maxRecords": 1}
+    params = {
+        "filterByFormula": formula,
+        "sort[0][field]": "fecha_fin",
+        "sort[0][direction]": "desc",
+    }
     resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_FINDESEMANA_TABLE),
         headers=_airtable_headers(),
@@ -337,7 +355,13 @@ def airtable_find_findesemana(cedula: str) -> dict[str, Any] | None:
             f"GET FinDeSemana HTTP {resp.status_code}: {resp.text[:200]}"
         )
     records = resp.json().get("records", [])
-    return records[0] if records else None
+    if not records:
+        return None
+    for rec in records:
+        estado = (rec.get("fields", {}).get("estado") or "").strip().upper()
+        if estado in ("", "AUTORIZADO"):
+            return rec
+    return records[0]
 
 
 def airtable_find_active_findesemana(cedula: str) -> dict[str, Any] | None:
@@ -372,10 +396,21 @@ def airtable_find_active_findesemana(cedula: str) -> dict[str, Any] | None:
 
 
 def airtable_find_persona(cedula: str) -> dict[str, Any] | None:
-    """Busca una cédula exacta en la tabla Personas."""
+    """Busca una cédula exacta en la tabla Personas.
+
+    Una misma cédula puede tener VARIAS filas (una por visita/autorización).
+    Preferimos una fila VIGENTE (autorizado + no vencida); si ninguna lo está,
+    devolvemos la de mayor `vence` para que el handler reporte el estado real.
+    Antes se pedía maxRecords=1 sin orden y Airtable podía devolver una fila
+    vencida aunque existiera otra vigente → SIN_AUTORIZACION indebido.
+    """
     cedula_clean = cedula.strip()
     formula = f"{{cedula}} = '{cedula_clean}'"
-    params = {"filterByFormula": formula, "maxRecords": 1}
+    params = {
+        "filterByFormula": formula,
+        "sort[0][field]": "vence",
+        "sort[0][direction]": "desc",
+    }
     resp = _airtable_request("GET",
         _airtable_url(AIRTABLE_PERSONAS_TABLE),
         headers=_airtable_headers(),
@@ -387,7 +422,12 @@ def airtable_find_persona(cedula: str) -> dict[str, Any] | None:
             f"GET Personas HTTP {resp.status_code}: {resp.text[:200]}"
         )
     records = resp.json().get("records", [])
-    return records[0] if records else None
+    if not records:
+        return None
+    for rec in records:
+        if _registro_vigente(rec.get("fields", {})):
+            return rec
+    return records[0]
 
 
 def airtable_create_record(table: str, fields: dict[str, Any]) -> str:
@@ -532,18 +572,108 @@ def airtable_find_active_person(cedula: str) -> dict[str, Any] | None:
 # ---------- Meshtastic helpers ----------
 
 
-def send_text(interface, destination_node: int, text: str) -> None:
+def send_text(interface, destination_node: int, text: str, attempt: int = 0) -> None:
     """Envía un texto como DM a un nodo.
 
     wantAck=True hace que el stack Meshtastic reintente hasta 3 veces si el
     destino no acusa recibo dentro del timeout. Sin esto, una pérdida puntual
     de paquete deja al portero esperando para siempre (hasta su timeout de 30s).
+
+    El ACK/NAK de cada envío se loguea (ver `_make_ack_logger`) para saber si
+    el radio del portero recibió la respuesta. Si llega NAK y el mensaje es una
+    respuesta al portero (ver `_NAK_RETRY_PREFIXES`), se reenvía hasta
+    `NAK_RETRIES` veces. `attempt` cuenta los reenvíos ya hechos.
     """
     try:
-        interface.sendText(text, destinationId=destination_node, wantAck=True)
-        log.info("📤 → %s: %s", _node_hex(destination_node), text)
+        interface.sendText(
+            text,
+            destinationId=destination_node,
+            wantAck=True,
+            onResponse=_make_ack_logger(interface, destination_node, text, attempt),
+        )
+        if attempt:
+            log.info("📤 → %s (reenvío %d/%d): %s", _node_hex(destination_node),
+                     attempt, NAK_RETRIES, text)
+        else:
+            log.info("📤 → %s: %s", _node_hex(destination_node), text)
     except Exception as e:
         log.error("✗ Error enviando a %s: %s", _node_hex(destination_node), e)
+
+
+# Reenvío tras NAK. El enlace Pi→portería es asimétrico (incidente 2026-10-16):
+# ~1/3 de las respuestas agotan los reintentos del radio (MAX_RETRANSMIT ~24 s).
+# Solo se reenvían respuestas que la app espera; la app ignora duplicados
+# (RESPUESTA* sin consulta pendiente se descarta, RESULTADO_* se deduplica).
+NAK_RETRIES = 2
+NAK_RETRY_DELAY_SECONDS = 2.0
+_NAK_RETRY_PREFIXES = (
+    "RESPUESTA|", "RESPUESTA_P|", "RESPUESTA_F|", "RESP_SOL|",
+    "RESULTADO_P|", "RESULTADO_V|", "RESULTADO_F|",
+)
+
+
+def _schedule_nak_retry(interface, destination_node: int, text: str, attempt: int) -> None:
+    """Reenvía `text` tras una pausa, fuera del hilo lector de Meshtastic.
+
+    Usa el interface vigente del holder por si hubo reconexión entre medio."""
+    def _resend():
+        iface = _conn.get() or interface
+        send_text(iface, destination_node, text, attempt)
+
+    t = threading.Timer(NAK_RETRY_DELAY_SECONDS, _resend)
+    t.daemon = True
+    t.start()
+
+
+def _make_ack_logger(interface, destination_node: int, text: str, attempt: int = 0):
+    """Callback que loguea el acuse de recibo de un DM saliente.
+
+    Meshtastic entrega el resultado del wantAck como paquete ROUTING:
+      - errorReason NONE y from == destino  → ACK real: el radio destino lo recibió.
+      - errorReason NONE y from == nosotros → ACK implícito: solo oímos a un
+        relay retransmitirlo; NO confirma que llegó al destino.
+      - otro errorReason (MAX_RETRANSMIT…)  → NAK: no se entregó.
+    La librería solo pasa los ACK a callbacks llamados `onAckNak`.
+    Ojo: no usar "❌"/"ERROR" en estos logs — los reenviaría guaica-error-watch.
+    """
+    sent_at = time.monotonic()
+    head = text.split("|", 2)
+    resumen = "|".join(head[:2]) if len(head) > 1 else text[:40]
+
+    def onAckNak(packet):
+        try:
+            ms = int((time.monotonic() - sent_at) * 1000)
+            routing = (packet.get("decoded") or {}).get("routing") or {}
+            reason = routing.get("errorReason", "NONE")
+            frm = packet.get("from")
+            my_num = interface.localNode.nodeNum if interface.localNode else None
+            dest = _node_hex(destination_node)
+            if reason != "NONE":
+                log.warning("📭 NAK %s de %s: %s tras %d ms (no entregado)",
+                            resumen, dest, reason, ms)
+                if text.startswith(_NAK_RETRY_PREFIXES):
+                    if attempt < NAK_RETRIES:
+                        log.info("🔁 Reenviando %s a %s (%d/%d)",
+                                 resumen, dest, attempt + 1, NAK_RETRIES)
+                        _schedule_nak_retry(interface, destination_node, text,
+                                            attempt + 1)
+                    else:
+                        log.warning("📭 %s a %s sin entregar tras %d reenvíos",
+                                    resumen, dest, NAK_RETRIES)
+            elif frm == destination_node:
+                log.info("📬 ACK %s de %s en %d ms (radio portero lo recibió)",
+                         resumen, dest, ms)
+            elif frm == my_num:
+                log.info("📬 ACK implícito %s hacia %s en %d ms (solo lo "
+                         "retransmitió un relay; sin confirmar destino)",
+                         resumen, dest, ms)
+            else:
+                log.info("📬 ACK %s hacia %s en %d ms (de %s)",
+                         resumen, dest, ms, _node_hex(frm or 0))
+        except Exception as e:  # el callback corre en el hilo lector
+            log.debug("ack logger falló: %s", e)
+
+    return onAckNak
 
 
 def _chunk_for_mesh(text: str, limit: int = _MESH_CHUNK_BYTES) -> list[str]:
@@ -1764,20 +1894,52 @@ def on_connection_lost(interface=None, topic=None) -> None:  # noqa: ARG001
 # ---------- Bootstrap ----------
 
 
-def build_interface():
-    """Crea el interface según las env vars."""
+def build_interface(should_stop=None):
+    """Crea el interface según las env vars.
+
+    NUNCA autodetecta el puerto serial. La portería debe hablar SIEMPRE con el
+    radio de siempre (CP2102 → nodo !9ea29bc4); un radio ajeno conectado a la
+    misma Pi no puede entrar en la ecuación. La autodetección de Meshtastic no
+    respeta eso: filtra por VID con whitelist {0x239a, 0x303a} (Adafruit,
+    Espressif), que NO incluye el CP2102 (0x10c4), así que elegiría el radio del
+    otro proyecto; con dos puertos llama a our_exit() y mata el proceso; y con
+    cero puertos devuelve un objeto a medio construir SIN lanzar excepción
+    (serial_interface.py:42-47), dejando el gateway "vivo pero sordo".
+    Por eso: puerto fijo (usar la ruta estable /dev/serial/by-id/... en .env),
+    espera a que reaparezca, y excepción si no vuelve para que el backoff de
+    reconnect_interface() reintente."""
     if MESHTASTIC_SERIAL:
         dev = MESHTASTIC_SERIAL
         if not os.path.exists(dev):
-            # Tras una reconexión el SO puede reasignar el puerto (ttyUSB0→ttyUSB1).
-            # Si el path configurado no existe, dejamos que Meshtastic autodetecte.
             log.warning(
-                "⚠️ %s no existe; dejando que Meshtastic autodetecte el puerto.", dev
+                "⏳ %s no existe; esperando hasta %ds a que reaparezca "
+                "(no se autodetecta: engancharía otro radio).",
+                dev, SERIAL_WAIT_SECONDS,
             )
-            dev = None
-        log.info("🔌 Abriendo Serial: %s", dev or "(autodetección)")
+            waited = 0
+            while waited < SERIAL_WAIT_SECONDS and not os.path.exists(dev):
+                if should_stop is not None and should_stop():
+                    raise RuntimeError("apagado solicitado mientras se esperaba el puerto")
+                time.sleep(1)
+                waited += 1
+            if not os.path.exists(dev):
+                raise RuntimeError(
+                    f"{dev} no reapareció tras {SERIAL_WAIT_SECONDS}s"
+                )
+            log.info("✅ %s reapareció tras %ds.", dev, waited)
+        log.info("🔌 Abriendo Serial: %s", dev)
         from meshtastic.serial_interface import SerialInterface
-        return SerialInterface(devPath=dev)
+        iface = SerialInterface(devPath=dev)
+        # Guardarraíl anti-zombi: SerialInterface solo asigna .stream si abrió de
+        # verdad. Sin esto un objeto a medio construir se guardaría como bueno y
+        # el gateway loguearía "✅ Reconectado" estando sordo.
+        if getattr(iface, "stream", None) is None:
+            try:
+                iface.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"SerialInterface no abrió {dev} (objeto sin stream)")
+        return iface
     if MESHTASTIC_TCP:
         log.info("🌐 Abriendo TCP: %s", MESHTASTIC_TCP)
         from meshtastic.tcp_interface import TCPInterface
@@ -1833,7 +1995,7 @@ def run_simulator() -> None:
             nodeNum = 0x49b54674
         localNode = _LocalNode()
 
-        def sendText(self, text, destinationId=None, wantAck=False):  # noqa: ARG002
+        def sendText(self, text, destinationId=None, wantAck=False, **kwargs):  # noqa: ARG002
             log.info("[SIM] sendText(%s, dst=%s)", text, _node_hex(destinationId or 0))
 
     iface = _FakeInterface()
@@ -1907,7 +2069,7 @@ def reconnect_interface(old_interface, should_stop):
     delay = RECONNECT_DELAY_SECONDS
     while not should_stop():
         try:
-            new_interface = build_interface()
+            new_interface = build_interface(should_stop)
         except Exception as e:  # noqa: BLE001
             log.error(
                 "🔁 Reconexión falló (%s) — reintento en %ds.",
@@ -1965,6 +2127,10 @@ def main() -> int:
         daemon=True,
     )
     poller_thread.start()
+
+    # Emisor de traceroutes hacia los sitios fijos de la mesh. Apagado por
+    # defecto (MESH_PROBE_ENABLED=0); comparte el stop_event del poller.
+    mesh_probe_tx.start(_conn, poller_stop)
 
     stop = False
 
