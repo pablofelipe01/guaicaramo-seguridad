@@ -7,7 +7,9 @@ import 'package:permission_handler/permission_handler.dart';
 import 'models/data_models.dart';
 import 'services/meshtastic_service.dart';
 import 'services/foreground_connection.dart';
+import 'services/gerentes_service.dart';
 import 'screens/chat_screen.dart';
+import 'screens/gerentes_screen.dart';
 import 'screens/map_screen.dart';
 import 'screens/recepcion_screen.dart';
 import 'screens/requests_screen.dart';
@@ -388,6 +390,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _service.addListener(_onServiceChange);
+    GerentesService.instance.addListener(_onGerentesChange);
     _bootstrap();
   }
 
@@ -401,7 +404,13 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _service.removeListener(_onServiceChange);
+    GerentesService.instance.removeListener(_onGerentesChange);
     super.dispose();
+  }
+
+  /// Repinta el badge de movimientos de gerentes por sincronizar.
+  void _onGerentesChange() {
+    if (mounted) setState(() {});
   }
 
   @override
@@ -464,6 +473,9 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
       case 4:
         return SalidasScreen(meshtasticService: _service);
       case 5:
+        // Independiente de la malla: trabaja con o sin internet.
+        return const GerentesScreen();
+      case 6:
         return SettingsScreen(
           meshtasticService: _service,
           onDeviceChange: _navigateToDeviceSelection,
@@ -487,6 +499,12 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
     if (pendingCount > 0) {
       extraInfo.add(
         '$pendingCount solicitud${pendingCount == 1 ? '' : 'es'} pendiente${pendingCount == 1 ? '' : 's'}',
+      );
+    }
+    final gerentesSync = GerentesService.instance.pendientesSync;
+    if (gerentesSync > 0) {
+      extraInfo.add(
+        '$gerentesSync movimiento${gerentesSync == 1 ? '' : 's'} de gerentes sin sincronizar',
       );
     }
 
@@ -532,6 +550,7 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final pendingCount = _service.pendingRequestsCount;
     final unreadChat = _service.unreadChatCount;
+    final gerentesSync = GerentesService.instance.pendientesSync;
 
     return PopScope(
       canPop: false,
@@ -590,6 +609,21 @@ class _MainScreenState extends State<MainScreen> with WidgetsBindingObserver {
               icon: Icon(Icons.outbox_outlined),
               selectedIcon: Icon(Icons.outbox),
               label: 'Salidas',
+            ),
+            NavigationDestination(
+              icon: Badge(
+                label: Text('$gerentesSync'),
+                isLabelVisible: gerentesSync > 0,
+                backgroundColor: Colors.orange.shade800,
+                child: const Icon(Icons.badge_outlined),
+              ),
+              selectedIcon: Badge(
+                label: Text('$gerentesSync'),
+                isLabelVisible: gerentesSync > 0,
+                backgroundColor: Colors.orange.shade800,
+                child: const Icon(Icons.badge),
+              ),
+              label: 'Gtes',
             ),
             const NavigationDestination(
               icon: Icon(Icons.settings_outlined),

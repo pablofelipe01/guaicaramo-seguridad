@@ -51,6 +51,8 @@
 		<string>Guaicaramo Control necesita Bluetooth para comunicarse con el nodo Meshtastic.</string>
 		<key>NSLocationWhenInUseUsageDescription</key>
 		<string>Guaicaramo Control usa ubicación para mostrar nodos GPS en el mapa.</string>
+		<key>NSMicrophoneUsageDescription</key>
+		<string>Guaicaramo Control usa el micrófono para dictar las observaciones de ingreso y salida de gerentes.</string>
 		<key>UIStatusBarHidden</key>
 		<false/>
 	</dict>
