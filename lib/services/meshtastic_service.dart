@@ -17,6 +17,7 @@ const String _vehicleRequestsKey = 'vehicle_requests';
 const String _personEntriesKey = 'person_entries';
 const String _personRequestsKey = 'person_requests';
 const String _itemsCacheKey = 'items_cache';
+const String _registrosPendientesKey = 'registros_pendientes';
 const String _messageHistoryKey = 'message_history';
 const String _lastSessionDateKey = 'last_session_date';
 const int _maxMessageHistory = 100;
@@ -189,6 +190,136 @@ class MeshtasticService extends ChangeNotifier {
       }
     }
     return null;
+  }
+
+  // ---------- Registros con confirmación (REG_OK / REG_ERR) ----------
+  //
+  // Las entradas se enviaban una sola vez y sin confirmación: si el mensaje se
+  // perdía en la malla, el portero veía "Entrada registrada" pero en Airtable
+  // no quedaba nada (2026-10-19). Ahora llevan `|#<regId>` y el gateway responde
+  // REG_OK|<regId> (creada) o REG_ERR|<regId> (Airtable falló). Sin respuesta se
+  // reenvía hasta [_regMaxIntentos] veces; después queda como fallida y el
+  // portero la ve en Recepción con "Reintentar". El gateway no duplica reenvíos.
+
+  static const int _regMaxIntentos = 3;
+
+  /// regId → registro sin confirmar (enviando o fallido). Se persiste.
+  final Map<String, RegistroPendiente> _registrosPendientes = {};
+
+  /// regId → espera del intento en curso. true=REG_OK, false=REG_ERR.
+  final Map<String, Completer<bool?>> _regWaiters = {};
+
+  /// Entradas que el gateway aún no confirmó, más viejas primero.
+  List<RegistroPendiente> get registrosPendientes =>
+      List.unmodifiable(_registrosPendientes.values);
+
+  /// regId corto (base 36) para no inflar el paquete LoRa.
+  String _newRegId() {
+    _requestSeq = (_requestSeq + 1) & 0xFFFF;
+    final ms = DateTime.now().millisecondsSinceEpoch.toRadixString(36);
+    return '$ms-${_requestSeq.toRadixString(36)}';
+  }
+
+  /// Encola [message] y lo envía en segundo plano hasta recibir REG_OK.
+  /// Devuelve enseguida; el avance se ve en [registrosPendientes].
+  Future<bool> _sendConfirmedRegistro(String message, String label) async {
+    final p = RegistroPendiente(
+      regId: _newRegId(),
+      message: message,
+      label: label,
+      createdAt: DateTime.now(),
+    );
+    _registrosPendientes[p.regId] = p;
+    await _saveRegistrosPendientes();
+    notifyListeners();
+    unawaited(_runRegistro(p));
+    return true;
+  }
+
+  Future<void> _runRegistro(RegistroPendiente p) async {
+    if (_regWaiters.containsKey(p.regId)) return; // ya hay un intento en curso
+    while (_registrosPendientes.containsKey(p.regId) &&
+        p.intentos < _regMaxIntentos) {
+      p.intentos++;
+      p.estado = RegistroEnvioEstado.enviando;
+      notifyListeners();
+      final waiter = Completer<bool?>();
+      _regWaiters[p.regId] = waiter;
+      final sent = await sendChatMessage(
+        '${p.message}|#${p.regId}',
+        destinationId: currentGatewayNodeId,
+      );
+      final ok = sent
+          ? await waiter.future
+              .timeout(gatewayReplyTimeout, onTimeout: () => null)
+          : null;
+      _regWaiters.remove(p.regId);
+      if (ok == true) {
+        debugPrint('✅ [REG] ${p.label} confirmada (#${p.regId})');
+        _registrosPendientes.remove(p.regId);
+        await _saveRegistrosPendientes();
+        notifyListeners();
+        return;
+      }
+      p.motivo = !sent
+          ? 'Sin conexión al nodo'
+          : ok == false
+              ? 'El gateway no pudo guardarla en Airtable'
+              : 'Sin confirmación del gateway';
+      debugPrint(
+          '⚠️ [REG] ${p.label} intento ${p.intentos}/$_regMaxIntentos: ${p.motivo}');
+      await _saveRegistrosPendientes();
+      if (!sent) await Future.delayed(const Duration(seconds: 10));
+    }
+    if (_registrosPendientes.containsKey(p.regId)) {
+      p.estado = RegistroEnvioEstado.fallido;
+      await _saveRegistrosPendientes();
+      notifyListeners();
+    }
+  }
+
+  /// El portero pide reenviar un registro fallido (mismo regId: no duplica).
+  void retryRegistro(String regId) {
+    final p = _registrosPendientes[regId];
+    if (p == null || _regWaiters.containsKey(regId)) return;
+    p.intentos = 0;
+    p.motivo = null;
+    unawaited(_runRegistro(p));
+  }
+
+  /// El portero descarta un registro fallido (ej: lo cargó a mano en Airtable).
+  void discardRegistro(String regId) {
+    if (_registrosPendientes.remove(regId) == null) return;
+    final waiter = _regWaiters[regId];
+    if (waiter != null && !waiter.isCompleted) waiter.complete(null);
+    _saveRegistrosPendientes();
+    notifyListeners();
+  }
+
+  /// REG_OK / REG_ERR del gateway.
+  void _handleRegConfirm(String regId, bool ok) {
+    final waiter = _regWaiters[regId];
+    if (waiter != null && !waiter.isCompleted) {
+      waiter.complete(ok);
+      return;
+    }
+    // Confirmación tardía (ya se agotó la espera): si es OK, la entrada sí quedó.
+    if (ok && _registrosPendientes.remove(regId) != null) {
+      debugPrint('🕐 [REG] Confirmación tardía #$regId');
+      _saveRegistrosPendientes();
+      notifyListeners();
+    }
+  }
+
+  Future<void> _saveRegistrosPendientes() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final encoded = jsonEncode(
+          _registrosPendientes.values.map((r) => r.toJson()).toList());
+      await prefs.setString(_registrosPendientesKey, encoded);
+    } catch (e) {
+      debugPrint('❌ [PERSIST] Error guardando registros pendientes: $e');
+    }
   }
 
   // ---------- Items (órdenes de salida) ----------
@@ -511,6 +642,22 @@ class MeshtasticService extends ChangeNotifier {
         for (final raw in decoded) {
           final it = Item.fromJson(raw as Map<String, dynamic>);
           _knownItems[it.numero] = it;
+        }
+      }
+
+      // Registros sin confirmar de una sesión anterior: quedan como fallidos
+      // para que el portero decida si reintentar (no se reenvían solos).
+      final registrosJson = prefs.getString(_registrosPendientesKey);
+      if (registrosJson != null) {
+        final decoded = jsonDecode(registrosJson) as List<dynamic>;
+        _registrosPendientes.clear();
+        for (final raw in decoded) {
+          final r = RegistroPendiente.fromJson(raw as Map<String, dynamic>);
+          if (r.estado == RegistroEnvioEstado.enviando) {
+            r.estado = RegistroEnvioEstado.fallido;
+            r.motivo ??= 'La app se cerró antes de confirmar';
+          }
+          _registrosPendientes[r.regId] = r;
         }
       }
 
@@ -1068,7 +1215,7 @@ class MeshtasticService extends ChangeNotifier {
     final message =
         'ENTRADA_V|$cedula|$placa|$approvedBy|${packed.join('|')}';
     debugPrint('🚗 [VEHICLE] ENTRADA_V → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Entrada vehículo $placa');
   }
 
   /// `REGISTRO_MANUAL|<status>|<cedula>|<placa>|<supervisor>|<comment>|<a1cc>|<a1nom>|...|<a4nom>`
@@ -1086,7 +1233,7 @@ class MeshtasticService extends ChangeNotifier {
     final message =
         'REGISTRO_MANUAL|$status|$cedula|$placa|$supervisor|$safeComment|${packed.join('|')}';
     debugPrint('🚗 [VEHICLE] REGISTRO_MANUAL → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Registro manual vehículo $placa');
   }
 
   // ---------- Solicitudes de aprobación al gateway (visitante no registrado) ----------
@@ -1340,7 +1487,7 @@ class MeshtasticService extends ChangeNotifier {
   }) async {
     final message = 'ENTRADA_F|$cedula|$approvedBy';
     debugPrint('🗓️ [FINDES] ENTRADA_F → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Entrada fin de semana CC $cedula');
   }
 
   /// `SALIDA_F|<cedula>` al gateway.
@@ -1360,7 +1507,7 @@ class MeshtasticService extends ChangeNotifier {
     final message =
         'REGISTRO_MANUAL_F|$status|$cedula|$supervisor|${comment ?? ''}';
     debugPrint('🗓️ [FINDES] REGISTRO_MANUAL_F → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Registro manual fin de semana CC $cedula');
   }
 
   // ---------- Peatones (paralelo a vehículos) ----------
@@ -1450,7 +1597,7 @@ class MeshtasticService extends ChangeNotifier {
   }) async {
     final message = 'ENTRADA_P|$cedula|$approvedBy';
     debugPrint('🚶 [PERSON] ENTRADA_P → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Entrada peatón CC $cedula');
   }
 
   /// `SALIDA_P|<cedula>` al gateway.
@@ -1470,7 +1617,7 @@ class MeshtasticService extends ChangeNotifier {
     final message =
         'REGISTRO_MANUAL_P|$status|$cedula|$supervisor|${comment ?? ''}';
     debugPrint('🚶 [PERSON] REGISTRO_MANUAL_P → gateway: $message');
-    return sendChatMessage(message, destinationId: currentGatewayNodeId);
+    return _sendConfirmedRegistro(message, 'Registro manual peatón CC $cedula');
   }
 
   /// Registra entrada en el estado local (y dispara envío al gateway).
@@ -1888,6 +2035,17 @@ class MeshtasticService extends ChangeNotifier {
             }
             completer.complete(result);
           }
+        }
+        _markPacketProcessed(packetId);
+        return;
+      }
+
+      // REG_OK|<regId> / REG_ERR|<regId> — el gateway confirma (o no) que
+      // guardó en Airtable una entrada enviada con `|#<regId>`.
+      if (text.startsWith('REG_OK|') || text.startsWith('REG_ERR|')) {
+        final parts = text.split('|');
+        if (parts.length >= 2) {
+          _handleRegConfirm(parts[1].trim(), parts[0] == 'REG_OK');
         }
         _markPacketProcessed(packetId);
         return;

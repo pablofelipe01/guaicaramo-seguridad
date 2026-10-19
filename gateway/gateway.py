@@ -14,8 +14,11 @@ Escucha mensajes en la red mesh y los traduce a operaciones en Airtable:
         RESPUESTA|<requestId>|RECHAZADO|<conductor>    (existe pero RECHAZADO)
         RESPUESTA|<requestId>|ERROR|<motivo>
 
-  ENTRADA_V|<cedula>|<placa>|<aprobadoPor>
+  ENTRADA_V|<cedula>|<placa>|<aprobadoPor>      (análogo: ENTRADA_P, ENTRADA_F)
       → inserta fila nueva en `Registros` con tipo=ENTRADA.
+        Si el último campo es `#<regId>` (app >= 0.12.0) responde
+        REG_OK|<regId> o REG_ERR|<regId>; un reenvío del mismo regId no duplica
+        la fila. Igual para REGISTRO_MANUAL / _P / _F.
 
   SALIDA_V|<placa>
       → busca el último registro de la placa con salida vacía y le pone exit_time.
@@ -53,6 +56,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -609,6 +613,7 @@ NAK_RETRY_DELAY_SECONDS = 2.0
 _NAK_RETRY_PREFIXES = (
     "RESPUESTA|", "RESPUESTA_P|", "RESPUESTA_F|", "RESP_SOL|",
     "RESULTADO_P|", "RESULTADO_V|", "RESULTADO_F|",
+    "REG_OK|", "REG_ERR|",
 )
 
 
@@ -839,7 +844,7 @@ def handle_consulta(interface, from_num: int, parts: list[str]) -> None:
         send_text(interface, from_num, f"RESPUESTA|{request_id}|ERROR|interno")
 
 
-def handle_entrada(interface, from_num: int, parts: list[str]) -> None:
+def handle_entrada(interface, from_num: int, parts: list[str]) -> bool:
     """ENTRADA_V|<cedula>|<placa>|<aprobadoPor>[|<a1cc>|<a1nom>|<a2cc>|<a2nom>|<a3cc>|<a3nom>|<a4cc>|<a4nom>]
 
     Las 8 partes finales (acompañantes) son opcionales — formatos viejos
@@ -847,7 +852,7 @@ def handle_entrada(interface, from_num: int, parts: list[str]) -> None:
     """
     if len(parts) < 4:
         log.warning("ENTRADA_V formato inválido: %s", parts)
-        return
+        return False
     _, cedula, placa, approved_by = parts[0], parts[1], parts[2].upper(), parts[3]
     acompanantes_text = _format_acompanantes(parts[4:12])
     log.info(
@@ -873,10 +878,13 @@ def handle_entrada(interface, from_num: int, parts: list[str]) -> None:
             fields["acompanantes"] = acompanantes_text
         record_id = airtable_create_registro(fields)
         log.info("✓ Entrada creada (record %s)", record_id)
+        return True
     except AirtableError as e:
         log.error("AirtableError en ENTRADA_V: %s", e)
+        return False
     except Exception:
         log.error("Excepción en ENTRADA_V:\n%s", traceback.format_exc())
+        return False
 
 
 def handle_salida(interface, from_num: int, parts: list[str]) -> None:
@@ -910,14 +918,14 @@ def handle_salida(interface, from_num: int, parts: list[str]) -> None:
         log.error("Excepción en SALIDA_V:\n%s", traceback.format_exc())
 
 
-def handle_registro_manual(interface, from_num: int, parts: list[str]) -> None:
+def handle_registro_manual(interface, from_num: int, parts: list[str]) -> bool:
     """REGISTRO_MANUAL|<status>|<cedula>|<placa>|<supervisor>|<comment>[|<a1cc>|<a1nom>|...|<a4nom>]
 
     Las 8 partes finales (acompañantes) son opcionales.
     """
     if len(parts) < 6:
         log.warning("REGISTRO_MANUAL formato inválido: %s", parts)
-        return
+        return False
     status = parts[1]
     cedula = parts[2]
     placa = parts[3].upper()
@@ -950,10 +958,13 @@ def handle_registro_manual(interface, from_num: int, parts: list[str]) -> None:
             fields["rejected_time"] = _now_iso()
         record_id = airtable_create_registro(fields)
         log.info("✓ Registro manual creado (record %s)", record_id)
+        return True
     except AirtableError as e:
         log.error("AirtableError en REGISTRO_MANUAL: %s", e)
+        return False
     except Exception:
         log.error("Excepción en REGISTRO_MANUAL:\n%s", traceback.format_exc())
+        return False
 
 
 # ---------- Handlers de peatones ----------
@@ -1009,11 +1020,11 @@ def handle_consulta_persona(interface, from_num: int, parts: list[str]) -> None:
         send_text(interface, from_num, f"RESPUESTA_P|{request_id}|ERROR|interno")
 
 
-def handle_entrada_persona(interface, from_num: int, parts: list[str]) -> None:
+def handle_entrada_persona(interface, from_num: int, parts: list[str]) -> bool:
     """ENTRADA_P|<cedula>|<aprobadoPor>."""
     if len(parts) < 3:
         log.warning("ENTRADA_P formato inválido: %s", parts)
-        return
+        return False
     _, cedula, approved_by = parts[0], parts[1], parts[2]
     log.info("🚶 ENTRADA_P cedula=%s aprobadoPor=%s", cedula, approved_by)
 
@@ -1030,10 +1041,13 @@ def handle_entrada_persona(interface, from_num: int, parts: list[str]) -> None:
             }
         )
         log.info("✓ Entrada peatonal creada (record %s)", record_id)
+        return True
     except AirtableError as e:
         log.error("AirtableError en ENTRADA_P: %s", e)
+        return False
     except Exception:
         log.error("Excepción en ENTRADA_P:\n%s", traceback.format_exc())
+        return False
 
 
 def handle_salida_persona(interface, from_num: int, parts: list[str]) -> None:
@@ -1067,11 +1081,11 @@ def handle_salida_persona(interface, from_num: int, parts: list[str]) -> None:
         log.error("Excepción en SALIDA_P:\n%s", traceback.format_exc())
 
 
-def handle_registro_manual_persona(interface, from_num: int, parts: list[str]) -> None:
+def handle_registro_manual_persona(interface, from_num: int, parts: list[str]) -> bool:
     """REGISTRO_MANUAL_P|<status>|<cedula>|<supervisor>|<comment>."""
     if len(parts) < 5:
         log.warning("REGISTRO_MANUAL_P formato inválido: %s", parts)
-        return
+        return False
     status = parts[1]
     cedula = parts[2]
     supervisor = parts[3]
@@ -1099,10 +1113,13 @@ def handle_registro_manual_persona(interface, from_num: int, parts: list[str]) -
             fields["rejected_time"] = _now_iso()
         record_id = airtable_create_registro(fields)
         log.info("✓ Registro manual peatonal creado (record %s)", record_id)
+        return True
     except AirtableError as e:
         log.error("AirtableError en REGISTRO_MANUAL_P: %s", e)
+        return False
     except Exception:
         log.error("Excepción en REGISTRO_MANUAL_P:\n%s", traceback.format_exc())
+        return False
 
 
 # ---------- Handlers de fin de semana ----------
@@ -1162,11 +1179,11 @@ def handle_consulta_findesemana(interface, from_num: int, parts: list[str]) -> N
         send_text(interface, from_num, f"RESPUESTA_F|{request_id}|ERROR|interno")
 
 
-def handle_entrada_findesemana(interface, from_num: int, parts: list[str]) -> None:
+def handle_entrada_findesemana(interface, from_num: int, parts: list[str]) -> bool:
     """ENTRADA_F|<cedula>|<aprobadoPor>."""
     if len(parts) < 3:
         log.warning("ENTRADA_F formato inválido: %s", parts)
-        return
+        return False
     _, cedula, approved_by = parts[0], parts[1], parts[2]
     log.info("🗓️ ENTRADA_F cedula=%s aprobadoPor=%s", cedula, approved_by)
 
@@ -1183,10 +1200,13 @@ def handle_entrada_findesemana(interface, from_num: int, parts: list[str]) -> No
             }
         )
         log.info("✓ Entrada fin-de-semana creada (record %s)", record_id)
+        return True
     except AirtableError as e:
         log.error("AirtableError en ENTRADA_F: %s", e)
+        return False
     except Exception:
         log.error("Excepción en ENTRADA_F:\n%s", traceback.format_exc())
+        return False
 
 
 def handle_salida_findesemana(interface, from_num: int, parts: list[str]) -> None:
@@ -1220,11 +1240,11 @@ def handle_salida_findesemana(interface, from_num: int, parts: list[str]) -> Non
         log.error("Excepción en SALIDA_F:\n%s", traceback.format_exc())
 
 
-def handle_registro_manual_findesemana(interface, from_num: int, parts: list[str]) -> None:
+def handle_registro_manual_findesemana(interface, from_num: int, parts: list[str]) -> bool:
     """REGISTRO_MANUAL_F|<status>|<cedula>|<supervisor>|<comment>."""
     if len(parts) < 5:
         log.warning("REGISTRO_MANUAL_F formato inválido: %s", parts)
-        return
+        return False
     status, cedula, supervisor = parts[1], parts[2], parts[3]
     comment = parts[4] if len(parts) > 4 else ""
     log.info(
@@ -1249,10 +1269,13 @@ def handle_registro_manual_findesemana(interface, from_num: int, parts: list[str
             fields["rejected_time"] = _now_iso()
         record_id = airtable_create_registro(fields)
         log.info("✓ Registro manual fin-de-semana creado (record %s)", record_id)
+        return True
     except AirtableError as e:
         log.error("AirtableError en REGISTRO_MANUAL_F: %s", e)
+        return False
     except Exception:
         log.error("Excepción en REGISTRO_MANUAL_F:\n%s", traceback.format_exc())
+        return False
 
 
 # ---------- Handlers de items (órdenes de salida) ----------
@@ -1803,6 +1826,49 @@ HANDLERS = {
 }
 
 
+# ---------- Confirmación de registros (REG_OK / REG_ERR) ----------
+#
+# Las entradas eran "dispara y olvida": si el mensaje se perdía en la malla, el
+# portero veía "Entrada registrada" pero en Airtable no quedaba nada (2026-10-19).
+# Desde la app 0.12.0 estos mensajes traen al final `#<regId>`; el gateway
+# contesta REG_OK|<regId> (fila creada) o REG_ERR|<regId> (no se pudo) y la app
+# reenvía si no le llega nada. Un reenvío de un registro ya creado solo se
+# reconfirma, no se duplica. Sin `#<regId>` (app vieja) todo sigue como antes.
+_CONFIRMED_PREFIXES = frozenset({
+    "ENTRADA_V", "ENTRADA_P", "ENTRADA_F",
+    "REGISTRO_MANUAL", "REGISTRO_MANUAL_P", "REGISTRO_MANUAL_F",
+})
+_REG_ID_RE = re.compile(r"#([A-Za-z0-9-]{4,32})")
+_REG_DONE_TTL_SECONDS = 6 * 3600
+# "<nodo>:<regId>" → time.monotonic() de cuando se creó en Airtable. Solo lo
+# toca on_receive (hilo lector de Meshtastic), así que no necesita lock.
+_reg_done: dict[str, float] = {}
+
+
+def _dispatch_confirmed(interface, from_num: int, prefix: str,
+                        parts: list[str], handler) -> None:
+    """Corre el handler de un registro y, si trae `#<regId>`, confirma el resultado."""
+    m = _REG_ID_RE.fullmatch(parts[-1]) if len(parts) > 1 else None
+    if m is None:
+        handler(interface, from_num, parts)
+        return
+    reg_id = m.group(1)
+    key = f"{from_num}:{reg_id}"
+    now = time.monotonic()
+    for k in [k for k, t in _reg_done.items() if now - t > _REG_DONE_TTL_SECONDS]:
+        del _reg_done[k]
+    if key in _reg_done:
+        log.info("♻️ %s #%s repetido — ya estaba creado, solo se reconfirma",
+                 prefix, reg_id)
+        send_text(interface, from_num, f"REG_OK|{reg_id}")
+        return
+    if handler(interface, from_num, parts[:-1]):
+        _reg_done[key] = now
+        send_text(interface, from_num, f"REG_OK|{reg_id}")
+    else:
+        send_text(interface, from_num, f"REG_ERR|{reg_id}")
+
+
 # ---------- Recepción de paquetes ----------
 
 
@@ -1848,7 +1914,10 @@ def on_receive(packet: dict[str, Any], interface) -> None:
 
         log.info("📨 ← %s: %s", _node_hex(from_num or 0), text)
         parts = text.split("|")
-        handler(interface, from_num, parts)
+        if prefix in _CONFIRMED_PREFIXES:
+            _dispatch_confirmed(interface, from_num, prefix, parts, handler)
+        else:
+            handler(interface, from_num, parts)
     except Exception:
         log.error("Excepción en on_receive:\n%s", traceback.format_exc())
 

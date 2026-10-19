@@ -806,3 +806,60 @@ class ChatDestination {
   @override
   int get hashCode => Object.hash(channel, nodeId);
 }
+
+/// Estado de un registro (entrada) enviado al gateway que espera `REG_OK`.
+enum RegistroEnvioEstado { enviando, fallido }
+
+/// Entrada enviada al gateway que todavía no tiene confirmación `REG_OK`.
+///
+/// El gateway confirma cada registro con `REG_OK|<regId>` (o `REG_ERR|<regId>`
+/// si Airtable falló). Mientras no llegue, la app reintenta; si se agotan los
+/// intentos queda [RegistroEnvioEstado.fallido] y el portero ve un aviso con
+/// "Reintentar". Se persiste para no perderlo si la app se cierra.
+class RegistroPendiente {
+  final String regId;
+
+  /// Mensaje del protocolo SIN el sufijo `|#<regId>` (se agrega al enviar).
+  final String message;
+
+  /// Texto para el portero, ej: "Entrada vehículo TSS388".
+  final String label;
+  final DateTime createdAt;
+  int intentos;
+  RegistroEnvioEstado estado;
+  String? motivo;
+
+  RegistroPendiente({
+    required this.regId,
+    required this.message,
+    required this.label,
+    required this.createdAt,
+    this.intentos = 0,
+    this.estado = RegistroEnvioEstado.enviando,
+    this.motivo,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'regId': regId,
+        'message': message,
+        'label': label,
+        'createdAt': createdAt.toIso8601String(),
+        'intentos': intentos,
+        'estado': estado.name,
+        'motivo': motivo,
+      };
+
+  factory RegistroPendiente.fromJson(Map<String, dynamic> json) =>
+      RegistroPendiente(
+        regId: json['regId'] as String,
+        message: json['message'] as String,
+        label: json['label'] as String,
+        createdAt: DateTime.parse(json['createdAt'] as String),
+        intentos: json['intentos'] as int? ?? 0,
+        estado: RegistroEnvioEstado.values.firstWhere(
+          (e) => e.name == json['estado'],
+          orElse: () => RegistroEnvioEstado.fallido,
+        ),
+        motivo: json['motivo'] as String?,
+      );
+}

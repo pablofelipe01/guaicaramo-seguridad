@@ -194,7 +194,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         placa: _placa,
         approvedBy: 'GATEWAY',
       );
-      _showSnack('Entrada registrada: $_placa');
+      _showSnack('Entrada registrada: $_placa — enviando al sistema…');
     } else {
       final nombre = _lastPersonCheck?.personName ?? _nombre;
       if (_isFinDeSemana) {
@@ -218,7 +218,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           approvedBy: 'GATEWAY',
         );
       }
-      _showSnack('Entrada registrada: $nombre');
+      _showSnack('Entrada registrada: $nombre — enviando al sistema…');
     }
     _resetForm();
   }
@@ -971,6 +971,93 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
     );
   }
 
+  /// Entradas que el gateway todavía no confirmó (REG_OK). Mientras se
+  /// reintenta se ve "Enviando…"; si se agotan los intentos queda en rojo con
+  /// "Reintentar" para que el portero no crea que quedó guardada.
+  Widget _buildRegistrosBanner() {
+    final pendientes = _service.registrosPendientes;
+    if (pendientes.isEmpty) return const SizedBox.shrink();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final r in pendientes)
+          if (r.estado == RegistroEnvioEstado.fallido)
+            Card(
+              elevation: 2,
+              color: Colors.red.shade50,
+              child: ListTile(
+                leading: const Icon(Icons.error, color: Colors.red),
+                title: Text(
+                  '${r.label} NO llegó al sistema',
+                  style: const TextStyle(
+                      fontWeight: FontWeight.bold, fontSize: 14),
+                ),
+                subtitle: Text(
+                  '${r.motivo ?? 'Sin confirmación'} · '
+                  '${r.createdAt.hour.toString().padLeft(2, '0')}:'
+                  '${r.createdAt.minute.toString().padLeft(2, '0')}',
+                ),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextButton(
+                      onPressed: () => _service.retryRegistro(r.regId),
+                      child: const Text('Reintentar'),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      tooltip: 'Descartar',
+                      onPressed: () => _confirmDiscardRegistro(r),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            Card(
+              color: Colors.grey.shade100,
+              child: ListTile(
+                dense: true,
+                leading: const SizedBox(
+                  width: 20,
+                  height: 20,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                title: Text('Enviando ${r.label}…'),
+                subtitle: Text(r.intentos > 1
+                    ? 'Intento ${r.intentos} de 3 · ${r.motivo ?? ''}'
+                    : 'Esperando confirmación del gateway'),
+              ),
+            ),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  Future<void> _confirmDiscardRegistro(RegistroPendiente r) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Descartar aviso'),
+        content: Text(
+          '${r.label} no está en el sistema central. Descártelo solo si ya '
+          'la registraron por otro medio (ej: directo en Airtable).',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancelar'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Descartar'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) _service.discardRegistro(r.regId);
+  }
+
   /// Banner con los resultados que recepción ya resolvió (push del gateway).
   /// El portero los ve aunque haya seguido con otra consulta.
   Widget _buildResultsBanner() {
@@ -1046,6 +1133,7 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
                 padding: EdgeInsets.only(bottom: 16.0),
                 child: LinearProgressIndicator(),
               ),
+            _buildRegistrosBanner(),
             _buildResultsBanner(),
             Center(child: _buildModeToggle()),
             const SizedBox(height: 16),
