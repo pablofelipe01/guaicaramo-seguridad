@@ -1,0 +1,14 @@
+[Unit]
+Description=Alertador en tiempo real de errores del gateway Guaicaramo -> Telegram
+After=network-online.target guaicaramo-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pfac
+ExecStart=/home/pfac/guaica-health/error_watch.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
