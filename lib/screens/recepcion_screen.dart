@@ -446,20 +446,24 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
         return Card(
           color: Colors.blue.shade50,
           elevation: 3,
-          child: const Padding(
-            padding: EdgeInsets.all(24.0),
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
             child: Column(
               children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 16),
+                const CircularProgressIndicator(),
+                const SizedBox(height: 16),
                 Text(
-                  'Consultando gateway…',
-                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+                  _service.consultandoAirtable
+                      ? 'Consultando Airtable por internet…'
+                      : 'Consultando gateway…',
+                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
                 ),
-                SizedBox(height: 4),
+                const SizedBox(height: 4),
                 Text(
-                  'La red puede tardar hasta un minuto. No repita la consulta.',
-                  style: TextStyle(fontSize: 13, color: Colors.grey),
+                  _service.consultandoAirtable
+                      ? 'El gateway no respondió a tiempo. No repita la consulta.'
+                      : 'La red puede tardar hasta un minuto. No repita la consulta.',
+                  style: const TextStyle(fontSize: 13, color: Colors.grey),
                 ),
               ],
             ),

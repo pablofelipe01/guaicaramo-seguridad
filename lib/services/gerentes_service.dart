@@ -4,6 +4,7 @@ import 'package:flutter/widgets.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/gerentes_models.dart';
+import 'consulta_airtable.dart';
 import 'gerentes_airtable.dart';
 
 const String _tokenKey = 'gerentes_airtable_token';
@@ -58,6 +59,21 @@ class GerentesService extends ChangeNotifier with WidgetsBindingObserver {
   /// Últimos 4 caracteres del token guardado (nunca se muestra completo).
   String? get tokenFinal =>
       configurado ? _token!.substring(_token!.length - 4) : null;
+
+  ConsultaAirtable? _consultasCache;
+
+  /// Cliente para consultar placas y personas directo en Airtable con este
+  /// mismo token: el respaldo de portería cuando el gateway no responde.
+  /// Null si no hay token configurado.
+  Future<ConsultaAirtable?> clienteConsultas() async {
+    await _cargado;
+    final t = _token;
+    if (t == null || t.isEmpty) return null;
+    if (_consultasCache?.token != t) {
+      _consultasCache = ConsultaAirtable(token: t, client: _httpClient);
+    }
+    return _consultasCache;
+  }
 
   // ---------- Datos locales ----------
 

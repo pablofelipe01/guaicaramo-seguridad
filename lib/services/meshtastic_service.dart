@@ -5,6 +5,8 @@ import 'package:flutter/foundation.dart';
 import 'package:meshtastic_flutter/meshtastic_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/data_models.dart';
+import 'consulta_airtable.dart';
+import 'gerentes_service.dart';
 
 const int _maxMessageBytes = 237;
 
@@ -159,6 +161,68 @@ class MeshtasticService extends ChangeNotifier {
   /// (vía repetidor) cada tramo de la malla tarda 4–25 s, así que una
   /// consulta sana puede tardar ~30 s ida y vuelta (medido 2026-10-16).
   static const Duration gatewayReplyTimeout = Duration(seconds: 75);
+
+  /// Sin respuesta del gateway en este tiempo, la consulta se hace también
+  /// directo en Airtable por internet (con el token del módulo de Gerentes).
+  /// Gana lo que llegue primero; si Airtable falla se sigue esperando al
+  /// gateway hasta [gatewayReplyTimeout].
+  static const Duration airtableFallbackAfter = Duration(seconds: 30);
+
+  /// Cliente del respaldo por internet; null si no hay token configurado.
+  Future<ConsultaAirtable?> Function() airtableRespaldo =
+      () => GerentesService.instance.clienteConsultas();
+
+  int _consultasAirtable = 0;
+
+  /// Hay consultas resolviéndose directo en Airtable (para la pantalla).
+  bool get consultandoAirtable => _consultasAirtable > 0;
+
+  /// Hace la consulta directo en Airtable. Null si no hay token o Airtable
+  /// no respondió: quien llama sigue con el resultado del gateway.
+  Future<T?> _consultarAirtable<T>(String tag,
+      Future<T> Function(ConsultaAirtable api, String? nodo) consulta) async {
+    final api = await airtableRespaldo();
+    if (api == null) {
+      debugPrint('$tag Sin token de Airtable: no hay respaldo por internet');
+      return null;
+    }
+    final myNum = myNodeNum;
+    final nodo = myNum == null
+        ? null
+        : '!${(myNum & 0xFFFFFFFF).toRadixString(16).padLeft(8, '0')}';
+    _consultasAirtable++;
+    notifyListeners();
+    try {
+      final result = await consulta(api, nodo);
+      debugPrint('$tag Respuesta directa de Airtable');
+      return result;
+    } catch (e) {
+      debugPrint('❌ $tag Respaldo Airtable falló: $e');
+      return null;
+    } finally {
+      _consultasAirtable--;
+      notifyListeners();
+    }
+  }
+
+  /// A los [airtableFallbackAfter] sin respuesta del gateway consulta
+  /// Airtable y, si contesta antes que el gateway, resuelve la consulta.
+  void _respaldoSiTarda<T>(
+    Map<String, Completer<T>> pending,
+    String requestId,
+    String tag,
+    Future<T> Function(ConsultaAirtable api, String? nodo) consulta,
+  ) {
+    Future.delayed(airtableFallbackAfter, () async {
+      if (!pending.containsKey(requestId)) return; // ya respondió o expiró
+      debugPrint('$tag Gateway sin respuesta en '
+          '${airtableFallbackAfter.inSeconds}s → Airtable ($requestId)');
+      final result = await _consultarAirtable(tag, consulta);
+      if (result == null) return;
+      final c = pending.remove(requestId);
+      if (c != null && !c.isCompleted) c.complete(result);
+    });
+  }
 
   /// Tras el timeout, cuánto tiempo más se recuerda una consulta para
   /// rescatar su respuesta tardía (ver [_takePendingCheck]).
@@ -1078,11 +1142,16 @@ class MeshtasticService extends ChangeNotifier {
     required String placa,
     Duration timeout = gatewayReplyTimeout,
   }) async {
+    const tag = '🚗 [VEHICLE]';
+    Future<PlateCheckResult> porAirtable(ConsultaAirtable api, String? nodo) =>
+        api.placa(placa, nodoOrigen: nodo);
+
     if (!isConnected || _client == null) {
-      return PlateCheckResult(
-        status: PlateCheckStatus.error,
-        note: 'Sin conexión al nodo',
-      );
+      return await _consultarAirtable(tag, porAirtable) ??
+          PlateCheckResult(
+            status: PlateCheckStatus.error,
+            note: 'Sin conexión al nodo',
+          );
     }
 
     final requestId = _newRequestId();
@@ -1097,11 +1166,14 @@ class MeshtasticService extends ChangeNotifier {
 
     if (!sent) {
       _pendingPlateChecks.remove(requestId);
-      return PlateCheckResult(
-        status: PlateCheckStatus.error,
-        note: 'No se pudo enviar al gateway',
-      );
+      return await _consultarAirtable(tag, porAirtable) ??
+          PlateCheckResult(
+            status: PlateCheckStatus.error,
+            note: 'No se pudo enviar al gateway',
+          );
     }
+
+    _respaldoSiTarda(_pendingPlateChecks, requestId, tag, porAirtable);
 
     Future.delayed(timeout, () {
       final pending = _pendingPlateChecks.remove(requestId);
@@ -1333,11 +1405,16 @@ class MeshtasticService extends ChangeNotifier {
     required String cedula,
     Duration timeout = gatewayReplyTimeout,
   }) async {
+    const tag = '🚶 [PERSON]';
+    Future<PersonCheckResult> porAirtable(ConsultaAirtable api, String? nodo) =>
+        api.persona(cedula, nodoOrigen: nodo);
+
     if (!isConnected || _client == null) {
-      return PersonCheckResult(
-        status: PlateCheckStatus.error,
-        note: 'Sin conexión al nodo',
-      );
+      return await _consultarAirtable(tag, porAirtable) ??
+          PersonCheckResult(
+            status: PlateCheckStatus.error,
+            note: 'Sin conexión al nodo',
+          );
     }
 
     final requestId = _newRequestId();
@@ -1352,11 +1429,14 @@ class MeshtasticService extends ChangeNotifier {
 
     if (!sent) {
       _pendingPersonChecks.remove(requestId);
-      return PersonCheckResult(
-        status: PlateCheckStatus.error,
-        note: 'No se pudo enviar al gateway',
-      );
+      return await _consultarAirtable(tag, porAirtable) ??
+          PersonCheckResult(
+            status: PlateCheckStatus.error,
+            note: 'No se pudo enviar al gateway',
+          );
     }
+
+    _respaldoSiTarda(_pendingPersonChecks, requestId, tag, porAirtable);
 
     Future.delayed(timeout, () {
       final pending = _pendingPersonChecks.remove(requestId);
@@ -1378,11 +1458,16 @@ class MeshtasticService extends ChangeNotifier {
     required String cedula,
     Duration timeout = gatewayReplyTimeout,
   }) async {
+    const tag = '🗓️ [FINDES]';
+    Future<PersonCheckResult> porAirtable(ConsultaAirtable api, String? nodo) =>
+        api.finDeSemana(cedula, nodoOrigen: nodo);
+
     if (!isConnected || _client == null) {
-      return PersonCheckResult(
-        status: PlateCheckStatus.error,
-        note: 'Sin conexión al nodo',
-      );
+      return await _consultarAirtable(tag, porAirtable) ??
+          PersonCheckResult(
+            status: PlateCheckStatus.error,
+            note: 'Sin conexión al nodo',
+          );
     }
 
     final requestId = _newRequestId();
@@ -1397,11 +1482,14 @@ class MeshtasticService extends ChangeNotifier {
 
     if (!sent) {
       _pendingPersonChecks.remove(requestId);
-      return PersonCheckResult(
-        status: PlateCheckStatus.error,
-        note: 'No se pudo enviar al gateway',
-      );
+      return await _consultarAirtable(tag, porAirtable) ??
+          PersonCheckResult(
+            status: PlateCheckStatus.error,
+            note: 'No se pudo enviar al gateway',
+          );
     }
+
+    _respaldoSiTarda(_pendingPersonChecks, requestId, tag, porAirtable);
 
     Future.delayed(timeout, () {
       final pending = _pendingPersonChecks.remove(requestId);
