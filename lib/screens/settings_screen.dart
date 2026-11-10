@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import '../models/data_models.dart';
+import '../services/lista_local.dart';
 import '../services/meshtastic_service.dart';
+import '../services/registro_local.dart';
 import '../widgets/battery_indicator.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -399,6 +401,58 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _buildListaLocalSection() {
+    return ListenableBuilder(
+      listenable: ListaLocal.instance,
+      builder: (context, _) {
+        final lista = ListaLocal.instance;
+        final edad = lista.antiguedad;
+        return Card(
+          elevation: 2,
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Row(
+                  children: [
+                    Icon(Icons.fact_check, color: Colors.teal),
+                    SizedBox(width: 12),
+                    Text(
+                      'Lista local y registro',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+                const Divider(),
+                _buildInfoRow(
+                  'Lista local',
+                  edad == null
+                      ? 'Sin descargar'
+                      : 'Hace ${edad.inMinutes} min'
+                          '${lista.utilizable ? '' : ' (vieja, no se usa)'}',
+                  valueColor: lista.utilizable ? Colors.green : Colors.orange,
+                ),
+                _buildInfoRow(
+                  'Autorizados',
+                  '${lista.totalPlacas} placas · ${lista.totalPersonas} '
+                      'personas · ${lista.totalFinDeSemana} fin de semana',
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Registro interno (un archivo de texto por día):\n'
+                  '${RegistroLocal.carpeta ?? 'no disponible'}',
+                  style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildActionsSection() {
     return Card(
       elevation: 2,
@@ -477,6 +531,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             _buildGatewaySection(),
             const SizedBox(height: 16),
             _buildLoraConfigSection(),
+            const SizedBox(height: 16),
+            _buildListaLocalSection(),
             const SizedBox(height: 16),
             _buildActionsSection(),
           ],

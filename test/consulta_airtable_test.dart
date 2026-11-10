@@ -66,6 +66,27 @@ void main() {
       expect(url.queryParameters['sort[0][field]'], _pVence);
     });
 
+    test('pide solo los campos que usa', () async {
+      await at.api.placa('ABC123');
+      expect(at.gets.single.queryParametersAll['fields[]'],
+          [_pConductor, _pAutorizado, _pVence, _pEstado]);
+    });
+
+    test('diferida: la alerta a recepción sale solo al confirmar', () async {
+      at.filas[ConsultaAirtable.tablaPlacas] = [
+        {'id': 'rec1', 'fields': {_pConductor: 'Ana', _pAutorizado: false}},
+      ];
+      final d = await at.api.placaDiferida('ABC123', nodoOrigen: '!0000abcd');
+      await Future<void>.delayed(Duration.zero);
+      expect(at.patches, isEmpty);
+
+      expect(d.confirmar().status, PlateCheckStatus.registeredUnauthorized);
+      d.confirmar(); // repetirlo no alerta dos veces
+      await Future<void>.delayed(Duration.zero);
+      expect(at.patches.single.$1, 'rec1');
+      expect(at.patches.single.$2[_pEstado], 'PENDIENTE');
+    });
+
     test('sin filas → NO_REGISTRADO', () async {
       final r = await at.api.placa('ABC123');
       expect(r.status, PlateCheckStatus.notRegistered);

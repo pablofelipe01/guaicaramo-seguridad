@@ -8,6 +8,8 @@ import 'models/data_models.dart';
 import 'services/meshtastic_service.dart';
 import 'services/foreground_connection.dart';
 import 'services/gerentes_service.dart';
+import 'services/lista_local.dart';
+import 'services/registro_local.dart';
 import 'screens/chat_screen.dart';
 import 'screens/gerentes_screen.dart';
 import 'screens/map_screen.dart';
@@ -16,8 +18,12 @@ import 'screens/requests_screen.dart';
 import 'screens/salidas_screen.dart';
 import 'screens/settings_screen.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Desde aquí todos los logs quedan también en archivo de texto.
+  await RegistroLocal.iniciar();
+  // Copia local de autorizados: se descarga sola en segundo plano.
+  unawaited(ListaLocal.instance.iniciar());
   // Puerto de comunicación del foreground service (requerido en v9.x).
   FlutterForegroundTask.initCommunicationPort();
   ForegroundConnection.initOptions();

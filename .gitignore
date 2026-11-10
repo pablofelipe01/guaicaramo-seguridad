@@ -56,3 +56,9 @@ android/*.keystore
 
 # APKs release — pesados, regeneración via scripts/release_apk.sh
 versiones/*.apk
+
+# Copias de la llave de firma en la raíz — NUNCA commitear
+/key.properties
+/keystore.jks
+*.jks
+*.keystore

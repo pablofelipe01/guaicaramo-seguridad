@@ -6,6 +6,7 @@ import 'package:meshtastic_flutter/meshtastic_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/data_models.dart';
 import 'consulta_airtable.dart';
+import 'lista_local.dart';
 import 'gerentes_service.dart';
 
 const int _maxMessageBytes = 237;
@@ -59,6 +60,10 @@ enum LoraRegion {
     );
   }
 }
+
+/// Consulta directa a Airtable cuya alerta a recepción queda por confirmar.
+typedef _ConsultaAirtable<T> = Future<ConsultaDiferida<T>> Function(
+    ConsultaAirtable api, String? nodo);
 
 class ScannedDevice {
   final String name;
@@ -162,11 +167,16 @@ class MeshtasticService extends ChangeNotifier {
   /// consulta sana puede tardar ~30 s ida y vuelta (medido 2026-10-16).
   static const Duration gatewayReplyTimeout = Duration(seconds: 75);
 
-  /// Sin respuesta del gateway en este tiempo, la consulta se hace también
-  /// directo en Airtable por internet (con el token del módulo de Gerentes).
-  /// Gana lo que llegue primero; si Airtable falla se sigue esperando al
+  /// Sin respuesta del gateway en este tiempo, vale la respuesta directa de
+  /// Airtable por internet (con el token del módulo de Gerentes). Esa consulta
+  /// sale al mismo tiempo que la del gateway, así con internet lento ya está
+  /// lista cuando se cumple el plazo. Si Airtable falla se sigue esperando al
   /// gateway hasta [gatewayReplyTimeout].
   static const Duration airtableFallbackAfter = Duration(seconds: 30);
+
+  /// Copia local de autorizados: responde al instante a quien esté vigente
+  /// en ella, sin pasar por el gateway ni por internet.
+  ListaLocal listaLocal = ListaLocal.instance;
 
   /// Cliente del respaldo por internet; null si no hay token configurado.
   Future<ConsultaAirtable?> Function() airtableRespaldo =
@@ -174,13 +184,14 @@ class MeshtasticService extends ChangeNotifier {
 
   int _consultasAirtable = 0;
 
-  /// Hay consultas resolviéndose directo en Airtable (para la pantalla).
+  /// Se está esperando la respuesta directa de Airtable (para la pantalla).
   bool get consultandoAirtable => _consultasAirtable > 0;
 
-  /// Hace la consulta directo en Airtable. Null si no hay token o Airtable
-  /// no respondió: quien llama sigue con el resultado del gateway.
-  Future<T?> _consultarAirtable<T>(String tag,
-      Future<T> Function(ConsultaAirtable api, String? nodo) consulta) async {
+  /// Hace la consulta directo en Airtable, sin alertar todavía a recepción
+  /// (eso ocurre al `confirmar()` el resultado). Null si no hay token o
+  /// Airtable no respondió: quien llama sigue con el resultado del gateway.
+  Future<ConsultaDiferida<T>?> _consultarAirtable<T>(
+      String tag, _ConsultaAirtable<T> consulta) async {
     final api = await airtableRespaldo();
     if (api == null) {
       debugPrint('$tag Sin token de Airtable: no hay respaldo por internet');
@@ -190,8 +201,6 @@ class MeshtasticService extends ChangeNotifier {
     final nodo = myNum == null
         ? null
         : '!${(myNum & 0xFFFFFFFF).toRadixString(16).padLeft(8, '0')}';
-    _consultasAirtable++;
-    notifyListeners();
     try {
       final result = await consulta(api, nodo);
       debugPrint('$tag Respuesta directa de Airtable');
@@ -199,28 +208,46 @@ class MeshtasticService extends ChangeNotifier {
     } catch (e) {
       debugPrint('❌ $tag Respaldo Airtable falló: $e');
       return null;
+    }
+  }
+
+  /// Espera [consulta] avisando a la pantalla que se está en Airtable.
+  Future<R> _esperandoAirtable<R>(Future<R> Function() consulta) async {
+    _consultasAirtable++;
+    notifyListeners();
+    try {
+      return await consulta();
     } finally {
       _consultasAirtable--;
       notifyListeners();
     }
   }
 
-  /// A los [airtableFallbackAfter] sin respuesta del gateway consulta
-  /// Airtable y, si contesta antes que el gateway, resuelve la consulta.
+  /// Sin gateway (sin nodo o no se pudo enviar): solo queda Airtable.
+  Future<T?> _soloAirtable<T>(String tag, _ConsultaAirtable<T> consulta) async =>
+      (await _esperandoAirtable(() => _consultarAirtable(tag, consulta)))
+          ?.confirmar();
+
+  /// Consulta Airtable desde ya, en paralelo con el gateway. Si a los
+  /// [airtableFallbackAfter] el gateway no ha respondido, resuelve con lo que
+  /// diga Airtable (reintenta una vez si el intento adelantado falló).
   void _respaldoSiTarda<T>(
     Map<String, Completer<T>> pending,
     String requestId,
     String tag,
-    Future<T> Function(ConsultaAirtable api, String? nodo) consulta,
+    _ConsultaAirtable<T> consulta,
   ) {
+    final adelantada = _consultarAirtable(tag, consulta);
     Future.delayed(airtableFallbackAfter, () async {
       if (!pending.containsKey(requestId)) return; // ya respondió o expiró
       debugPrint('$tag Gateway sin respuesta en '
           '${airtableFallbackAfter.inSeconds}s → Airtable ($requestId)');
-      final result = await _consultarAirtable(tag, consulta);
+      final result = await _esperandoAirtable(() async =>
+          await adelantada ?? await _consultarAirtable(tag, consulta));
       if (result == null) return;
+      // Si el gateway respondió mientras tanto, gana él y no se alerta dos veces.
       final c = pending.remove(requestId);
-      if (c != null && !c.isCompleted) c.complete(result);
+      if (c != null && !c.isCompleted) c.complete(result.confirmar());
     });
   }
 
@@ -1143,11 +1170,15 @@ class MeshtasticService extends ChangeNotifier {
     Duration timeout = gatewayReplyTimeout,
   }) async {
     const tag = '🚗 [VEHICLE]';
-    Future<PlateCheckResult> porAirtable(ConsultaAirtable api, String? nodo) =>
-        api.placa(placa, nodoOrigen: nodo);
+    Future<ConsultaDiferida<PlateCheckResult>> porAirtable(
+            ConsultaAirtable api, String? nodo) =>
+        api.placaDiferida(placa, nodoOrigen: nodo);
+
+    final local = listaLocal.placa(placa);
+    if (local != null) return local;
 
     if (!isConnected || _client == null) {
-      return await _consultarAirtable(tag, porAirtable) ??
+      return await _soloAirtable(tag, porAirtable) ??
           PlateCheckResult(
             status: PlateCheckStatus.error,
             note: 'Sin conexión al nodo',
@@ -1166,7 +1197,7 @@ class MeshtasticService extends ChangeNotifier {
 
     if (!sent) {
       _pendingPlateChecks.remove(requestId);
-      return await _consultarAirtable(tag, porAirtable) ??
+      return await _soloAirtable(tag, porAirtable) ??
           PlateCheckResult(
             status: PlateCheckStatus.error,
             note: 'No se pudo enviar al gateway',
@@ -1406,11 +1437,15 @@ class MeshtasticService extends ChangeNotifier {
     Duration timeout = gatewayReplyTimeout,
   }) async {
     const tag = '🚶 [PERSON]';
-    Future<PersonCheckResult> porAirtable(ConsultaAirtable api, String? nodo) =>
-        api.persona(cedula, nodoOrigen: nodo);
+    Future<ConsultaDiferida<PersonCheckResult>> porAirtable(
+            ConsultaAirtable api, String? nodo) =>
+        api.personaDiferida(cedula, nodoOrigen: nodo);
+
+    final local = listaLocal.persona(cedula);
+    if (local != null) return local;
 
     if (!isConnected || _client == null) {
-      return await _consultarAirtable(tag, porAirtable) ??
+      return await _soloAirtable(tag, porAirtable) ??
           PersonCheckResult(
             status: PlateCheckStatus.error,
             note: 'Sin conexión al nodo',
@@ -1429,7 +1464,7 @@ class MeshtasticService extends ChangeNotifier {
 
     if (!sent) {
       _pendingPersonChecks.remove(requestId);
-      return await _consultarAirtable(tag, porAirtable) ??
+      return await _soloAirtable(tag, porAirtable) ??
           PersonCheckResult(
             status: PlateCheckStatus.error,
             note: 'No se pudo enviar al gateway',
@@ -1459,11 +1494,15 @@ class MeshtasticService extends ChangeNotifier {
     Duration timeout = gatewayReplyTimeout,
   }) async {
     const tag = '🗓️ [FINDES]';
-    Future<PersonCheckResult> porAirtable(ConsultaAirtable api, String? nodo) =>
-        api.finDeSemana(cedula, nodoOrigen: nodo);
+    Future<ConsultaDiferida<PersonCheckResult>> porAirtable(
+            ConsultaAirtable api, String? nodo) =>
+        api.finDeSemanaDiferida(cedula, nodoOrigen: nodo);
+
+    final local = listaLocal.finDeSemana(cedula);
+    if (local != null) return local;
 
     if (!isConnected || _client == null) {
-      return await _consultarAirtable(tag, porAirtable) ??
+      return await _soloAirtable(tag, porAirtable) ??
           PersonCheckResult(
             status: PlateCheckStatus.error,
             note: 'Sin conexión al nodo',
@@ -1482,7 +1521,7 @@ class MeshtasticService extends ChangeNotifier {
 
     if (!sent) {
       _pendingPersonChecks.remove(requestId);
-      return await _consultarAirtable(tag, porAirtable) ??
+      return await _soloAirtable(tag, porAirtable) ??
           PersonCheckResult(
             status: PlateCheckStatus.error,
             note: 'No se pudo enviar al gateway',

@@ -476,6 +476,8 @@ class _RecepcionScreenState extends State<RecepcionScreen> {
           color: Colors.green,
           title: 'AUTORIZADO',
           subtitle: _approvedSubtitle,
+          // Si respondió la copia local, dice de cuándo son los datos.
+          info: _isVehicle ? _lastPlateCheck?.note : _lastPersonCheck?.note,
           primaryButton: ElevatedButton.icon(
             onPressed: _registerEntryFromGateway,
             icon: const Icon(Icons.login),

@@ -1,8 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show HandshakeException, SocketException;
+import 'dart:io' show HandshakeException, HttpClient, SocketException;
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 import '../models/gerentes_models.dart';
+
+/// Cliente HTTP único para todo lo que habla con Airtable. Mantiene abierta la
+/// conexión entre peticiones: abrirla (DNS + TCP + TLS) es ~75 % del tiempo de
+/// una consulta, y con internet lento es lo que más se nota.
+final http.Client clienteAirtable =
+    IOClient(HttpClient()..idleTimeout = const Duration(minutes: 2));
 
 /// Qué salió mal al hablar con Airtable. Decide qué hace la cola.
 enum FalloAirtable {
@@ -70,7 +77,7 @@ class GerentesAirtable {
     this.baseId = baseGuaicaramo,
     http.Client? client,
     this.timeout = const Duration(seconds: 20),
-  }) : _client = client ?? http.Client();
+  }) : _client = client ?? clienteAirtable;
 
   final String token;
   final String baseId;

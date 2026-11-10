@@ -169,6 +169,12 @@ log = logging.getLogger("guaicaramo-gateway")
 # ---------- Airtable client ----------
 
 
+# Una sola sesión para todo Airtable: reutiliza la conexión HTTPS entre
+# peticiones. Abrirla (DNS + TCP + TLS) es ~75 % del tiempo de cada consulta,
+# y con internet lento es lo que más demora la respuesta al portero.
+_airtable_session = requests.Session()
+
+
 class AirtableError(RuntimeError):
     """Error al hablar con Airtable."""
 
@@ -204,7 +210,7 @@ def _airtable_request(method: str, url: str, **kwargs) -> "requests.Response":
     resp = None
     for attempt in range(1, attempts + 1):
         try:
-            resp = requests.request(method, url, **kwargs)
+            resp = _airtable_session.request(method, url, **kwargs)
         except requests.exceptions.RequestException as e:
             if attempt >= attempts:
                 raise AirtableError(
@@ -438,7 +444,7 @@ def airtable_find_persona(cedula: str) -> dict[str, Any] | None:
 def airtable_create_record(table: str, fields: dict[str, Any]) -> str:
     """Crea una fila en cualquier tabla. typecast=True permite que Airtable
     cree opciones de singleSelect al vuelo (ej: estado='PENDIENTE')."""
-    resp = requests.post(
+    resp = _airtable_session.post(
         _airtable_url(table),
         headers=_airtable_headers(),
         json={"fields": fields, "typecast": True},
@@ -485,7 +491,7 @@ def airtable_list(table: str, formula: str, max_records: int = 100) -> list[dict
 def airtable_create_registro(fields: dict[str, Any]) -> str:
     # typecast=true permite que Airtable cree nuevas opciones de singleSelect
     # al vuelo (ej: categoria='FIN_DE_SEMANA' que no estaba pre-definida).
-    resp = requests.post(
+    resp = _airtable_session.post(
         _airtable_url(AIRTABLE_REGISTROS_TABLE),
         headers=_airtable_headers(),
         json={"fields": fields, "typecast": True},
